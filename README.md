@@ -24,8 +24,11 @@ radio only transmits and receives audio; everything else is software:
   that is transmitting, with callsign, SNR and link statistics.
 
 Typical throughput through a repeater with a full-quieting signal:
-16-QAM rate 3/4 carries about 3.4 kbit/s net, used as ~1.2 kbit/s voice plus
-~1.8–2 kbit/s video (96×72 at ~2 frames/s), or at 64-QAM about 5 kbit/s.
+16-QAM rate 3/4 carries about 3.4 kbit/s net at 1600 baud, used as
+~1.2 kbit/s voice plus ~1.8–2 kbit/s video (96×72 at ~2 frames/s); 2000 baud
+and 64-QAM / shaped 256-QAM raise that to 5–7 kbit/s.  On a radio's flat
+9600-baud data port the 4000-baud profile carries 8–16 kbit/s (128×96 or
+160×120 at 4–5 frames/s).
 
 The full mathematics of the design is in [DESIGN.md](DESIGN.md).
 
@@ -73,6 +76,37 @@ the receivers follow whoever is keyed.
 `--video` accepts a camera index, a video file, a still image, or `test`
 (a synthetic talking head used by the simulator).  `--audio` accepts `mic`,
 `none`, `synth` or a `.wav` file.
+
+### Waveform profiles: `--baud 1600 | 2000 | 4000`
+
+| profile | symbol rate | audio band | internal rate | use |
+|---------|-------------|------------|---------------|-----|
+| `--baud 1600` (default) | 1600 Bd | 620–2780 Hz | 8 kHz | any voice radio / repeater, mic & speaker jacks |
+| `--baud 2000` | 2000 Bd | 450–2950 Hz | 8 kHz | voice path with good audio response (+25 % symbols, +~45 % video) |
+| `--baud 4000` | 4000 Bd | 500–5500 Hz | 16 kHz | **flat 9600-baud data port** (unfiltered audio): 2.5× the symbols |
+
+The receiver listens for all three profiles at once and follows whichever
+acquires, so stations can switch profiles without coordination.
+
+**9600-port operation (`--baud 4000`).**  Connect the sound card to the
+radio's 6-pin mini-DIN data port (9600 mode: pins "PKD/TXD" and "RXD9600")
+or an equivalent flat discriminator-out / modulator-in path.  That path has
+no pre-emphasis, no microphone limiter and no 300–3000 Hz audio filters,
+only the IF filter, so a 4000-baud waveform up to 5.5 kHz fits.  Set the
+drive for about 3 kHz peak deviation on a 25 kHz channel (the TX level
+`--level` plus the interface pot, as for 9600-baud packet) and use the
+radio's wide (25 kHz) setting.  Through a repeater this needs a repeater
+built with flat audio (as for 9600 packet); most voice repeaters are not,
+so `--baud 4000` is mainly for simplex or data-capable repeaters.
+Discriminator noise rises with frequency, so a few dB more signal is needed
+than the band-average SNR suggests.
+
+### Long codes: `--long-code`
+
+One LDPC codeword spans all seven payload blocks of a superframe instead of
+one per block.  Measured gain is about 1 dB (16-QAM 3/4 decodes 6/6
+superframes at 11 dB where the short code manages 1/6).  The price is
+all-or-nothing decoding of the superframe and about 20 ms more latency.
 
 ## Radio hook-up and levels
 
@@ -123,8 +157,19 @@ uniform 256-QAM does not.  Example at 128×96, 4 frames per superframe:
 | 256qam-s5.5 | 4.2 kbit/s | 29.9 dB |
 | 256qam-3/4  | 4.7 kbit/s | 30.5 dB |
 
-A superframe lasts 1.53 s.  Voice at 1200 bit/s costs 237 bytes of it; the
-rest goes to video.  Block 0 of every superframe is always QPSK rate-1/2 and
+A superframe lasts 1.53 s at 1600 Bd (1.22 s at 2000 Bd, 0.61 s at 4000
+Bd); the byte counts above scale with the symbol rate.  Voice at 1200 bit/s
+costs 237 bytes of a 1600-Bd superframe; the rest goes to video.  Measured
+video rates with voice on (test scene, through the modelled channels):
+
+| profile / mode | video bit rate | picture |
+|----------------|----------------|---------|
+| 1600 Bd, 16qam-3/4 | 1.7 kbit/s | 96×72, 2 fps, 26.6 dB |
+| 2000 Bd, 16qam-3/4 | 2.5 kbit/s | 96×72, 2.5 fps, 27.5 dB |
+| 2000 Bd, 256qam-s5.5, long code | 5.4 kbit/s | 128×96, 3.3 fps, 30.7 dB |
+| 4000 Bd flat, 16qam-3/4, long code | 6.1 kbit/s | 128×96, 5 fps, 27.0 dB |
+| 4000 Bd flat, 64qam-3/4, long code | 10.1 kbit/s | 128×96, 5 fps, 29.5 dB |
+| 4000 Bd flat, 256qam-s5.5, long code | 12.9 kbit/s | 160×120, 5 fps, 29.3 dB |  Block 0 of every superframe is always QPSK rate-1/2 and
 carries the header (callsign, sequence, layout), so the station identity is
 decodable well below the payload threshold.  A full-quieting FM signal
 through a repeater typically gives 25–35 dB audio SNR, enough for 64-QAM.

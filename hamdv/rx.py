@@ -10,7 +10,8 @@ import numpy as np
 from .framing import (Header, PKT_AUDIO, PKT_VIDEO, PKT_VMETA, PKT_TEXT, PKT_INFO, AUDIO_MODES,
                       decode_superframe, DecodedSuperframe)
 from .modem import Demodulator, EqualisedBlock
-from .params import ModemParams, DEFAULT, DIGITAL_MODES
+from .params import ModemParams, DEFAULT, DIGITAL_MODES, PROFILES
+from .audioio import StreamResampler
 from .softvideo import SoftDecoder, SoftConfig, unpack_meta
 from .videocodec import VideoDecoder
 from .interp import dense_field
@@ -31,13 +32,26 @@ class FrameInfo:
 
 
 class Receiver:
-    def __init__(self, p: ModemParams = DEFAULT, verbose: bool = False,
+    """Audio in (any rate) -> decoded media.  Listens for every waveform profile
+    (1600 / 2000 Bd voice, 4000 Bd flat) at once and follows whichever acquires."""
+
+    def __init__(self, p: Optional[ModemParams] = None, verbose: bool = False,
                  on_frame: Optional[Callable[[np.ndarray, FrameInfo], None]] = None,
                  on_audio: Optional[Callable[[np.ndarray], None]] = None,
-                 on_text: Optional[Callable[[str, str], None]] = None):
-        self.p = p
+                 on_text: Optional[Callable[[str, str], None]] = None,
+                 profiles: Optional[List[str]] = None, fs_in: int = 8000):
+        if p is not None:
+            profiles = [p.name]
+        self.profiles = {name: PROFILES[name] for name in (profiles or list(PROFILES))}
         self.verbose = verbose
-        self.dem = Demodulator(p, verbose=verbose)
+        self.fs_in = fs_in
+        self.dems: Dict[str, Demodulator] = {n: Demodulator(pp, verbose=verbose) for n, pp in self.profiles.items()}
+        self.resamplers: Dict[str, StreamResampler] = {n: StreamResampler(fs_in, pp.fs) for n, pp in self.profiles.items()}
+        self.n_events_by: Dict[str, int] = {n: 0 for n in self.profiles}
+        self.active: Optional[str] = None
+        first = next(iter(self.profiles))
+        self.p = self.profiles[first]
+        self.dem = self.dems[first]
         self.on_frame = on_frame
         self.on_audio = on_audio
         self.on_text = on_text
@@ -51,18 +65,35 @@ class Receiver:
         self.n_events = 0
         self.status = dict(state="searching", callsign="", snr_db=float("nan"), sf_total=0, sf_ok=0,
                            blocks_ok=0, blocks_total=0, frames=0, audio_frames=0, text="",
-                           mode="", video="", last_rx=0.0, sro_ppm=0.0, cfo_hz=0.0)
+                           mode="", video="", last_rx=0.0, sro_ppm=0.0, cfo_hz=0.0, profile="", baud=0)
 
     # ------------------------------------------------------------------ input
-    def feed(self, samples: np.ndarray):
-        self.dem.feed(samples)
-        for e in self.dem.events[self.n_events:]:
-            self.n_events += 1
-            if e.startswith("LOST"):
-                self.pending.clear()
-                self.status["state"] = "searching"
-            elif e.startswith("ACQ"):
-                self.status["state"] = "locked"
+    def feed(self, samples: np.ndarray, fs_in: Optional[int] = None):
+        """Feed audio samples (at fs_in, default the rate given at construction)."""
+        if fs_in is not None and fs_in != self.fs_in:
+            self.fs_in = fs_in
+            self.resamplers = {n: StreamResampler(fs_in, pp.fs) for n, pp in self.profiles.items()}
+        samples = np.asarray(samples, dtype=np.float64)
+        targets = [self.active] if self.active else list(self.profiles)
+        for name in targets:
+            x = samples if self.profiles[name].fs == self.fs_in else self.resamplers[name].process(samples)
+            self.dems[name].feed(x)
+            for e in self.dems[name].events[self.n_events_by[name]:]:
+                self.n_events_by[name] += 1
+                if e.startswith("ACQ") and self.active is None:
+                    self.active = name
+                    self.p = self.profiles[name]
+                    self.dem = self.dems[name]
+                    self.status["state"] = "locked"
+                    self.status["profile"] = name
+                    self.status["baud"] = int(round(self.p.baud))
+                elif e.startswith("LOST") and self.active == name:
+                    self.active = None
+                    self.pending.clear()
+                    self.status["state"] = "searching"
+        if self.active is None:
+            return
+        self.dem = self.dems[self.active]
         if self.dem.blocks:
             for blk in self.dem.blocks:
                 self.pending.setdefault(blk.sf_index, []).append(blk)

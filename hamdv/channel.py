@@ -22,6 +22,7 @@ from .dsp import resample_ratio, bandpass_power
 @dataclass
 class ChannelConfig:
     fs: int = 8000
+    flat: bool = False             # 9600-baud data port: flat DC-6 kHz path, no emphasis, no mic limiter
     snr_db: float = 25.0
     sro_ppm: float = 40.0          # sample-rate offset
     gain: float = 0.8
@@ -60,12 +61,40 @@ def _radio_chain(x: np.ndarray, fs: int, cfg: ChannelConfig) -> np.ndarray:
     return x
 
 
+def _flat_chain(x: np.ndarray, fs: int, cfg: ChannelConfig) -> np.ndarray:
+    """9600-port path: modulator input -> IF filter -> discriminator output, twice (via a repeater)."""
+    # deviation limiter is far away at sensible drive; model a gentle soft clip
+    x = np.tanh(0.3 * x * cfg.limiter_drive * 2.0) / (0.3 * cfg.limiter_drive * 2.0)
+    b, a = signal.butter(1, 20.0 / (fs / 2), "high")          # AC coupling
+    x = signal.lfilter(b, a, x)
+    b, a = signal.ellip(5, 0.3, 50, 5800.0 / (fs / 2))        # IF / post-discriminator low-pass
+    x = signal.lfilter(b, a, x)
+    x = signal.lfilter(b, a, x)                                # repeater receive + transmit
+    b, a = signal.butter(1, 20.0 / (fs / 2), "high")
+    x = signal.lfilter(b, a, x)
+    return x
+
+
 def simulate(audio: np.ndarray, cfg: ChannelConfig) -> np.ndarray:
-    """Pass TX audio (float, 8 kHz) through the modelled channel; returns RX audio."""
+    """Pass TX audio (float, at cfg.fs) through the modelled channel; returns RX audio."""
     rng = np.random.default_rng(cfg.seed)
     fs = cfg.fs
     x = np.asarray(audio, dtype=np.float64)
     x = np.concatenate([np.zeros(int(cfg.delay_s * fs)), x, np.zeros(int(0.5 * fs))])
+    if cfg.flat:
+        y = _flat_chain(x, fs, cfg) * cfg.gain
+        band = (500.0, 5500.0)
+        sig_p = bandpass_power(y, fs, *band)
+        # discriminator noise rises with frequency (~f^2 power spectrum) with a small flat floor
+        white = rng.standard_normal(len(y))
+        noise = signal.lfilter([1.0, -1.0], [1.0], white) * 3.0 + 0.3 * white
+        b, a = signal.ellip(5, 0.3, 50, 5800.0 / (fs / 2))
+        noise = signal.lfilter(b, a, noise)
+        noise *= np.sqrt(sig_p / bandpass_power(noise, fs, *band) / 10 ** (cfg.snr_db / 10))
+        y = y + noise
+        if cfg.sro_ppm:
+            y = resample_ratio(y, 1.0 + cfg.sro_ppm * 1e-6)
+        return y
     y = _radio_chain(x, fs, cfg) * cfg.gain
     if cfg.id_tone:
         t = np.arange(len(y)) / fs

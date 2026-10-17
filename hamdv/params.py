@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class ModemParams:
+    name: str = "voice"
     fs: int = 8000               # internal sample rate (Hz)
     sps: int = 5                 # samples per symbol -> 1600 Bd
     fc: float = 1700.0           # carrier (Hz)
@@ -81,4 +82,13 @@ HEADER_MODE = 0          # block 0 of every superframe always uses the most robu
 BLOCK_DIGITAL = 0
 BLOCK_ANALOG = 1
 
-DEFAULT = ModemParams()
+# Waveform profiles.  "voice" profiles fit the 300-3000 Hz passband of a voice
+# repeater; "flat" is for the 9600-baud data port (flat discriminator /
+# modulator path, no pre-emphasis, no mic limiter) which passes ~DC-6 kHz.
+PROFILES = {
+    "voice":   ModemParams(name="voice", fs=8000, sps=5, fc=1700.0, alpha=0.35),     # 1600 Bd, 620-2780 Hz
+    "voice2k": ModemParams(name="voice2k", fs=8000, sps=4, fc=1700.0, alpha=0.25),   # 2000 Bd, 450-2950 Hz
+    "flat":    ModemParams(name="flat", fs=16000, sps=4, fc=3000.0, alpha=0.25),     # 4000 Bd, 500-5500 Hz
+}
+BAUD_PROFILE = {1600: "voice", 2000: "voice2k", 4000: "flat"}
+DEFAULT = PROFILES["voice"]

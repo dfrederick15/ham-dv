@@ -48,10 +48,11 @@ def list_devices() -> str:
 class AudioInput:
     """Microphone / radio audio input, delivered as 8 kHz float samples."""
 
-    def __init__(self, device=None, fs_dev: int = 48000, blocksize: int = 4800):
+    def __init__(self, device=None, fs_dev: int = 48000, blocksize: int = 4800, fs_internal: int = INTERNAL_FS):
         import sounddevice as sd
         self.q: "queue.Queue[np.ndarray]" = queue.Queue()
-        self.rs = StreamResampler(fs_dev, INTERNAL_FS)
+        self.fs_internal = fs_internal
+        self.rs = StreamResampler(fs_dev, fs_internal)
         self.buf = np.zeros(0)
         self.stream = sd.InputStream(device=device, samplerate=fs_dev, channels=1, dtype="float32",
                                      blocksize=blocksize, callback=self._cb)
@@ -91,9 +92,10 @@ class AudioInput:
 class AudioOutput:
     """Speaker / radio microphone output fed with 8 kHz float samples."""
 
-    def __init__(self, device=None, fs_dev: int = 48000, blocksize: int = 2400):
+    def __init__(self, device=None, fs_dev: int = 48000, blocksize: int = 2400, fs_internal: int = INTERNAL_FS):
         import sounddevice as sd
-        self.rs = StreamResampler(INTERNAL_FS, fs_dev)
+        self.fs_internal = fs_internal
+        self.rs = StreamResampler(fs_internal, fs_dev)
         self.lock = threading.Lock()
         self.buf = np.zeros(0, dtype=np.float32)
         self.stream = sd.OutputStream(device=device, samplerate=fs_dev, channels=1, dtype="float32",
@@ -143,8 +145,8 @@ class WavWriter:
         self.w.close()
 
 
-def read_wav(path: str) -> np.ndarray:
-    """Read a mono/stereo wav of any rate; return float samples at 8 kHz."""
+def read_wav(path: str, fs_out: int = INTERNAL_FS) -> np.ndarray:
+    """Read a mono/stereo wav of any rate; return float samples at fs_out."""
     with wave.open(path, "rb") as w:
         fs = w.getframerate()
         n = w.getnframes()
@@ -161,9 +163,9 @@ def read_wav(path: str) -> np.ndarray:
         raise ValueError("unsupported sample width")
     if ch > 1:
         x = x.reshape(-1, ch).mean(axis=1)
-    if fs != INTERNAL_FS:
-        g = np.gcd(fs, INTERNAL_FS)
-        x = signal.resample_poly(x, INTERNAL_FS // g, fs // g)
+    if fs != fs_out:
+        g = np.gcd(fs, fs_out)
+        x = signal.resample_poly(x, fs_out // g, fs // g)
     return x
 
 

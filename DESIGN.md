@@ -46,6 +46,23 @@ Occupied band: $f_c \pm (1+\alpha)/(2T) = 1700 \pm 1080$ Hz.  All symbol
 alphabets have unit average power; the TX output is scaled to the configured
 RMS and peak-limited at $3\times$RMS.
 
+Three profiles share the block structure and differ only in these
+constants (the receiver runs all three acquisition correlators in parallel
+and follows the one that locks):
+
+| profile | $f_s$ | samples/symbol | $1/T$ | $f_c$ | $\alpha$ | band |
+|---|---|---|---|---|---|---|
+| voice | 8 kHz | 5 | 1600 Bd | 1700 Hz | 0.35 | 620–2780 Hz |
+| voice2k | 8 kHz | 4 | 2000 Bd | 1700 Hz | 0.25 | 450–2950 Hz |
+| flat (9600-baud data port) | 16 kHz | 4 | 4000 Bd | 3000 Hz | 0.25 | 500–5500 Hz |
+
+The flat profile assumes the radio's unfiltered modulator-in /
+discriminator-out path (no pre-emphasis, no limiter, no voice-band
+filters).  Discriminator noise after FM demodulation has a power spectrum
+rising as $f^2$, so the upper tones see a worse SNR than the lower ones; the
+per-tone MMSE weights (§3.4) account for that automatically and the
+channel simulator models it.
+
 ### 2.1 Transmission structure
 
 ```
@@ -139,17 +156,29 @@ of each block, and their error power is a per-block sanity check on $\sigma^2_{e
 
 ### 4.1 Quasi-cyclic LDPC construction
 
-$H$ is built from $31\times31$ circulant permutation matrices.  The base
-matrix has block-column weight 3; shifts are drawn pseudo-randomly (fixed
-seed, so both ends build the same code) subject to the girth-6 condition on
-every $2\times2$ sub-array of non-empty blocks with shifts $\begin{psmallmatrix}a&b\\c&d\end{psmallmatrix}$:
-$a - b + d - c \not\equiv 0 \pmod{31}$ (no 4-cycles).  Codeword length equals
-the block's bit capacity: $n = 248 \cdot b$ for $b$ bits per symbol
-($496/992/1488$), rates 1/2 and 3/4.
+$H = [H_u \,|\, H_p]$ is built from $31\times31$ circulant permutation
+matrices.  The information part $H_u$ has block-column weight 3 with shifts
+drawn pseudo-randomly (fixed seed, so both ends build the same code) subject
+to the girth-6 condition on every $2\times2$ sub-array of non-empty blocks
+with shifts $\begin{psmallmatrix}a&b\\c&d\end{psmallmatrix}$:
+$a - b + d - c \not\equiv 0 \pmod{31}$ (no 4-cycles).  The parity part $H_p$
+is a block staircase of identity circulants on the diagonal and
+sub-diagonal (an irregular repeat–accumulate structure as in DVB-S2 and
+IEEE 802.16e), which is invertible by construction.
 
-Encoding: $H$ is row-reduced over GF(2) once; pivot columns are parity
-positions, free columns carry information, and $c_{\text{pivot}} = H_{rref}[:,\text{free}]\,u \pmod 2$
-is the unique solution of $Hc = 0$.
+Encoding is therefore linear time and needs no matrix inversion:
+$s_i = \sum_j C(\sigma_{ij})\,u_j$ for block row $i$, then
+$p_0 = s_0$, $p_i = p_{i-1} \oplus s_i$ (accumulate).  Codeword length equals
+the bit capacity of a block or of a group of blocks: $n = 248\,b\,n_b$ for
+$b$ bits per symbol and $n_b$ blocks coded together, rates 1/2 and 3/4.
+
+**Long codes.**  With the header flag `LONGCODE` one codeword spans all
+digital payload blocks of the superframe ($n_b = 7$, $n$ up to 13 888).
+Longer codes decode closer to capacity: measured AWGN thresholds improve
+from 3.0 / 11.5 / 17.0 dB (QPSK-1/2, 16-QAM-3/4, 64-QAM-3/4) to
+2.0 / 10.5 / 16.0 dB, and the error-rate cliff becomes steeper.  Decoding
+costs 11–23 ms per superframe.  The shaped modes (§4.4) use the same
+scheme with the amplitude labels of all $n_b$ blocks as information bits.
 
 ### 4.2 Decoding
 

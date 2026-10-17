@@ -10,13 +10,16 @@ drawn by a seeded generator subject to the girth-6 condition: for every
     a - b + d - c  !=  0  (mod p),
 which rules out length-4 cycles in the Tanner graph.
 
-Encoding
---------
-H is reduced to row echelon form over GF(2) once at construction time.
-Pivot columns become parity positions; the remaining ("free") columns carry
-information bits.  For information word u the parity is the matrix product
-    c[pivot] = H_rref[:, free] u   (mod 2),
-which is exactly the condition H c = 0.
+Structure and encoding
+----------------------
+H = [H_u | H_p] where H_u (information part) has block-column weight 3 and
+H_p is a block "staircase": identity circulants on the diagonal and the
+sub-diagonal (an irregular repeat-accumulate structure, as in DVB-S2 and
+IEEE 802.16e).  H_p is therefore invertible and encoding is linear time:
+    s_i = sum_j C(shift_ij) u_j           (syndrome of the information bits)
+    p_0 = s_0,   p_i = p_{i-1} + s_i      (accumulate, mod 2)
+No Gaussian elimination is needed, which makes codewords spanning a whole
+superframe (n up to ~14000) practical.
 
 Decoding
 --------
@@ -34,8 +37,11 @@ import numpy as np
 
 
 def _no_four_cycle(base: np.ndarray, col: int, rows: np.ndarray, shifts: np.ndarray, p: int) -> bool:
-    """Check candidate column (rows, shifts) against all previously placed columns."""
-    for c2 in range(col):
+    """Check candidate column (rows, shifts) against all already placed columns."""
+    placed = np.nonzero((base >= 0).any(axis=0))[0]
+    for c2 in placed:
+        if c2 == col:
+            continue
         other = base[:, c2]
         # rows where both columns are non-empty
         common = [(r, s) for r, s in zip(rows, shifts) if other[r] >= 0]
@@ -53,10 +59,18 @@ def _no_four_cycle(base: np.ndarray, col: int, rows: np.ndarray, shifts: np.ndar
 
 
 def make_base_matrix(block_rows: int, block_cols: int, p: int, col_weight: int = 3, seed: int = 1234) -> np.ndarray:
+    """Base matrix [info part | staircase parity part], block_cols = total block columns."""
     rng = np.random.default_rng(seed)
     base = -np.ones((block_rows, block_cols), dtype=np.int64)
     row_fill = np.zeros(block_rows, dtype=np.int64)
-    for c in range(block_cols):
+    n_info = block_cols - block_rows
+    # parity part: staircase of identity circulants (shift 0)
+    for r in range(block_rows):
+        base[r, n_info + r] = 0
+        if r > 0:
+            base[r, n_info + r - 1] = 0
+        row_fill[r] = 2 if r > 0 else 1
+    for c in range(n_info):
         for attempt in range(20000):
             # prefer rows with the fewest entries so row weights stay balanced
             order = np.argsort(row_fill + rng.random(block_rows) * 0.5)
@@ -113,10 +127,11 @@ def gf2_rref(h: np.ndarray):
 class LDPCCode:
     n: int
     k: int
+    p: int
     h: np.ndarray            # parity-check matrix (m x n) uint8
-    free_cols: np.ndarray    # information positions in the codeword
-    pivot_cols: np.ndarray   # parity positions
-    gen_part: np.ndarray     # (rank x k): c[pivot] = gen_part @ u mod 2
+    base: np.ndarray         # base matrix of circulant shifts
+    free_cols: np.ndarray    # information positions in the codeword (0..k-1)
+    pivot_cols: np.ndarray   # parity positions (k..n-1)
     # decoder tables (edges sorted by check node)
     edge_row: np.ndarray
     edge_col: np.ndarray
@@ -126,17 +141,28 @@ class LDPCCode:
         u = np.asarray(u, dtype=np.uint8)
         if len(u) != self.k:
             raise ValueError(f"expected {self.k} info bits, got {len(u)}")
-        c = np.zeros(self.n, dtype=np.uint8)
-        c[self.free_cols] = u
-        par = (self.gen_part.astype(np.int64) @ u.astype(np.int64)) & 1
-        c[self.pivot_cols] = par.astype(np.uint8)
-        return c
+        p = self.p
+        br = self.base.shape[0]
+        n_info = self.k // p
+        ub = u.reshape(n_info, p)
+        par = np.zeros((br, p), dtype=np.uint8)
+        acc = np.zeros(p, dtype=np.uint8)
+        for r in range(br):
+            srow = np.zeros(p, dtype=np.uint8)
+            for c in range(n_info):
+                sft = self.base[r, c]
+                if sft >= 0:
+                    # circulant C(s)[i, (i+s) mod p] = 1  ->  (C u)[i] = u[(i+s) mod p]
+                    srow ^= np.roll(ub[c], -sft)
+            acc = acc ^ srow
+            par[r] = acc
+        return np.concatenate([u, par.reshape(-1)])
 
     def syndrome_ok(self, c: np.ndarray) -> bool:
         return not np.any((self.h.astype(np.int64) @ c.astype(np.int64)) & 1)
 
     def extract(self, c: np.ndarray) -> np.ndarray:
-        return c[self.free_cols]
+        return c[: self.k]
 
     def decode(self, llr: np.ndarray, max_iter: int = 40, alpha: float = 0.8):
         """Normalised min-sum decoding of channel LLRs (positive = bit 0).
@@ -184,13 +210,10 @@ def get_code(n: int, rate_num: int, rate_den: int, p: int = 31, seed: int = 1234
     br = bc - (bc * rate_num) // rate_den
     base = make_base_matrix(br, bc, p, 3, seed + 1000 * bc + br)
     h = expand_base(base, p)
-    hr, piv = gf2_rref(h)
-    piv = np.array(piv, dtype=np.int64)
-    free = np.array(sorted(set(range(n)) - set(piv.tolist())), dtype=np.int64)
-    gen_part = hr[:, free].copy()
+    k = n - br * p
     rows, cols = np.nonzero(h)
     order = np.lexsort((cols, rows))
     rows, cols = rows[order], cols[order]
     row_start = np.concatenate([[0], np.nonzero(np.diff(rows))[0] + 1])
-    return LDPCCode(n=n, k=len(free), h=h, free_cols=free, pivot_cols=piv, gen_part=gen_part,
+    return LDPCCode(n=n, k=k, p=p, h=h, base=base, free_cols=np.arange(k), pivot_cols=np.arange(k, n),
                     edge_row=rows, edge_col=cols, row_start=row_start)

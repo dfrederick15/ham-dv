@@ -36,6 +36,7 @@ VERSION = 1
 PKT_PAD, PKT_HEADER, PKT_AUDIO, PKT_VIDEO, PKT_VMETA, PKT_TEXT, PKT_INFO = 0, 1, 2, 3, 4, 5, 6
 FLAG_LAST = 1
 FLAG_ANALOG_VIDEO = 2
+FLAG_LONGCODE = 4          # one LDPC codeword spans all digital payload blocks of the superframe
 AUDIO_MODES = {0: 0, 1: 1200, 2: 1600, 3: 2400}
 ANALOG_BACKOFF = 0.75      # analog symbols are Gaussian: back them off 2.5 dB so the radio's limiter stays out
 AUDIO_MODE_IDX = {v: k for k, v in AUDIO_MODES.items()}
@@ -128,6 +129,10 @@ class Header:
     def analog_video(self) -> bool:
         return bool(self.flags & FLAG_ANALOG_VIDEO)
 
+    @property
+    def long_code(self) -> bool:
+        return bool(self.flags & FLAG_LONGCODE)
+
     def n_analog_blocks(self, p: ModemParams) -> int:
         return sum(1 for b in range(1, p.blocks_per_sf) if (self.block_types >> b) & 1)
 
@@ -138,98 +143,110 @@ def interleaver(n: int) -> np.ndarray:
     return np.random.default_rng(0xC0DE + n).permutation(n)
 
 
-def mode_code(mode: int, p: ModemParams = DEFAULT):
+def mode_code(mode: int, p: ModemParams = DEFAULT, nb: int = 1):
+    """LDPC code for `nb` data blocks coded together (nb > 1 = long code spanning the superframe)."""
     name, bps, rn, rd = DIGITAL_MODES[mode]
-    n = p.data_sym_per_block * bps
+    n = p.data_sym_per_block * bps * nb
     return get_code(n, rn, rd), bps
 
 
 @lru_cache(maxsize=None)
-def pas_layout(mode: int, p: ModemParams = DEFAULT):
-    """Column -> (symbol, bit) assignment for a shaped mode.
+def pas_layout(mode: int, p: ModemParams = DEFAULT, nb: int = 1):
+    """Column -> (block, symbol, bit) assignment for a shaped mode over nb blocks.
 
-    The first 3 x 496 free (information) columns of the systematic LDPC code
-    carry the amplitude labels, the parity columns (and any surplus free
-    columns, which carry plain user bits) land on the two sign bits of each
-    symbol.  Returns (code, pas, amp_cols, extra_cols, sym_bit_of_col (n, 2)).
+    The first 3 x 496 x nb (information) columns of the systematic LDPC code
+    carry the amplitude labels (block-major), the parity columns land on the
+    two sign bits of each symbol.  Returns (code, pas, n_amp_bits, sym_bit (n, 3)).
     """
-    code, bps = mode_code(mode, p)
+    code, bps = mode_code(mode, p, nb)
     pas = pas_mode(PAS_RATES[mode])
-    n_amp_bits = 3 * AMPS_PER_BLOCK
-    if code.k < n_amp_bits:
-        raise RuntimeError("LDPC code too weak for PAS layout")
-    amp_cols = code.free_cols[:n_amp_bits]
-    extra_cols = code.free_cols[n_amp_bits:]
-    sign_cols = np.concatenate([code.pivot_cols, extra_cols])
-    sym_bit = np.zeros((code.n, 2), dtype=np.int64)
-    # amplitude slot j: amplitude index i = j // 3 -> symbol i // 2, dimension i % 2, bit 1..3 or 5..7
+    n_amp_bits = 3 * AMPS_PER_BLOCK * nb
+    if code.k != n_amp_bits:
+        raise RuntimeError("PAS layout needs k == 3 x 496 x nb")
+    nsym = p.data_sym_per_block
+    sym_bit = np.zeros((code.n, 3), dtype=np.int64)
     j = np.arange(n_amp_bits)
-    i = j // 3
-    sym_bit[amp_cols, 0] = i // 2
-    sym_bit[amp_cols, 1] = 1 + (j % 3) + 4 * (i % 2)
-    s = np.arange(len(sign_cols))
-    sym_bit[sign_cols, 0] = s // 2
-    sym_bit[sign_cols, 1] = 4 * (s % 2)
-    return code, pas, amp_cols, extra_cols, sym_bit
+    i = j // 3                                   # amplitude index (block-major)
+    blk, il = i // AMPS_PER_BLOCK, i % AMPS_PER_BLOCK
+    sym_bit[:n_amp_bits, 0] = blk
+    sym_bit[:n_amp_bits, 1] = il // 2
+    sym_bit[:n_amp_bits, 2] = 1 + (j % 3) + 4 * (il % 2)
+    s = np.arange(code.n - n_amp_bits)           # sign slots (block-major)
+    sym_bit[n_amp_bits:, 0] = s // AMPS_PER_BLOCK
+    sym_bit[n_amp_bits:, 1] = (s % AMPS_PER_BLOCK) // 2
+    sym_bit[n_amp_bits:, 2] = 4 * (s % 2)
+    return code, pas, n_amp_bits, sym_bit
 
 
-def block_capacity_bytes(mode: int, p: ModemParams = DEFAULT) -> int:
+def block_capacity_bytes(mode: int, p: ModemParams = DEFAULT, nb: int = 1) -> int:
+    """User bytes carried by a group of nb blocks coded together."""
     if mode in PAS_RATES:
-        code, pas, amp_cols, extra_cols, _ = pas_layout(mode, p)
-        return (pas.k_dm + len(extra_cols)) // 8
-    code, _ = mode_code(mode, p)
+        return (pas_mode(PAS_RATES[mode]).k_dm * nb) // 8
+    code, _ = mode_code(mode, p, nb)
     return code.k // 8
 
 
-def encode_digital_block(data: bytes, mode: int, p: ModemParams = DEFAULT) -> np.ndarray:
-    """bytes (<= capacity) -> 248 QAM symbols."""
+def encode_digital_group(data: bytes, mode: int, nb: int = 1, p: ModemParams = DEFAULT) -> List[np.ndarray]:
+    """bytes (<= capacity) -> nb arrays of 248 QAM symbols (one LDPC codeword over all of them)."""
     if mode in PAS_RATES:
-        return _encode_pas_block(data, mode, p)
-    code, bps = mode_code(mode, p)
+        return _encode_pas_group(data, mode, nb, p)
+    code, bps = mode_code(mode, p, nb)
     bits = np.unpackbits(np.frombuffer(data.ljust(code.k // 8, b"\0"), dtype=np.uint8))
     u = np.zeros(code.k, dtype=np.uint8)
     u[: min(len(bits), code.k)] = bits[: code.k]
-    cw = code.encode(u)
-    cw = cw[interleaver(code.n)]
-    return map_bits(cw, bps)
+    cw = code.encode(u)[interleaver(code.n)]
+    syms = map_bits(cw, bps)
+    return [syms[i * p.data_sym_per_block:(i + 1) * p.data_sym_per_block] for i in range(nb)]
 
 
-def _encode_pas_block(data: bytes, mode: int, p: ModemParams) -> np.ndarray:
-    code, pas, amp_cols, extra_cols, sym_bit = pas_layout(mode, p)
-    cap = (pas.k_dm + len(extra_cols)) // 8
+def encode_digital_block(data: bytes, mode: int, p: ModemParams = DEFAULT) -> np.ndarray:
+    return encode_digital_group(data, mode, 1, p)[0]
+
+
+def _encode_pas_group(data: bytes, mode: int, nb: int, p: ModemParams) -> List[np.ndarray]:
+    code, pas, n_amp_bits, sym_bit = pas_layout(mode, p, nb)
+    cap = (pas.k_dm * nb) // 8
     bits = np.unpackbits(np.frombuffer(data.ljust(cap, b"\0")[:cap], dtype=np.uint8))
-    bits = np.concatenate([bits, np.zeros(pas.k_dm + len(extra_cols) - len(bits), dtype=np.uint8)])
-    u = np.zeros(code.k, dtype=np.uint8)
-    u[: 3 * AMPS_PER_BLOCK] = pas.amplitude_bits(bits[: pas.k_dm])     # shaped amplitudes = info bits
-    u[3 * AMPS_PER_BLOCK:] = bits[pas.k_dm: pas.k_dm + len(extra_cols)]
+    bits = np.concatenate([bits, np.zeros(pas.k_dm * nb - len(bits), dtype=np.uint8)])
+    u = np.concatenate([pas.amplitude_bits(bits[b * pas.k_dm:(b + 1) * pas.k_dm]) for b in range(nb)])
     cw = code.encode(u)
-    labels = np.zeros((p.data_sym_per_block, 8), dtype=np.uint8)
-    labels[sym_bit[:, 0], sym_bit[:, 1]] = cw
-    return pas.map_labels(labels)
+    labels = np.zeros((nb, p.data_sym_per_block, 8), dtype=np.uint8)
+    labels[sym_bit[:, 0], sym_bit[:, 1], sym_bit[:, 2]] = cw
+    return [pas.map_labels(labels[b]) for b in range(nb)]
 
 
-def _decode_pas_block(blk: EqualisedBlock, mode: int, p: ModemParams) -> Tuple[bytes, bool]:
-    code, pas, amp_cols, extra_cols, sym_bit = pas_layout(mode, p)
-    l = llrs(blk.symbols, 8, blk.noise_var, points=pas.points, log_prior=pas.log_prior).reshape(-1, 8)
-    col_llr = l[sym_bit[:, 0], sym_bit[:, 1]]
+def _decode_pas_group(blocks: List[EqualisedBlock], mode: int, p: ModemParams) -> Tuple[bytes, bool]:
+    nb = len(blocks)
+    code, pas, n_amp_bits, sym_bit = pas_layout(mode, p, nb)
+    l = np.stack([llrs(b.symbols, 8, b.noise_var, points=pas.points, log_prior=pas.log_prior).reshape(-1, 8) for b in blocks])
+    col_llr = l[sym_bit[:, 0], sym_bit[:, 1], sym_bit[:, 2]]
     cw, ok, _ = code.decode(col_llr)
     u = code.extract(cw)
-    user, comp_ok = pas.user_bits(u[: 3 * AMPS_PER_BLOCK])
-    bits = np.concatenate([user, u[3 * AMPS_PER_BLOCK:]])
-    cap = (pas.k_dm + len(extra_cols)) // 8
+    parts, comp_ok = [], True
+    for b in range(nb):
+        ub, cok = pas.user_bits(u[b * 3 * AMPS_PER_BLOCK:(b + 1) * 3 * AMPS_PER_BLOCK])
+        parts.append(ub)
+        comp_ok &= cok
+    bits = np.concatenate(parts)
+    cap = (pas.k_dm * nb) // 8
     return np.packbits(bits[: cap * 8]).tobytes(), ok and comp_ok
 
 
-def decode_digital_block(blk: EqualisedBlock, mode: int, p: ModemParams = DEFAULT) -> Tuple[bytes, bool]:
+def decode_digital_group(blocks: List[EqualisedBlock], mode: int, p: ModemParams = DEFAULT) -> Tuple[bytes, bool]:
     if mode in PAS_RATES:
-        return _decode_pas_block(blk, mode, p)
-    code, bps = mode_code(mode, p)
-    l = llrs(blk.symbols, bps, blk.noise_var)
+        return _decode_pas_group(blocks, mode, p)
+    nb = len(blocks)
+    code, bps = mode_code(mode, p, nb)
+    l = np.concatenate([llrs(b.symbols, bps, b.noise_var) for b in blocks])
     de = np.empty_like(l)
     de[interleaver(code.n)] = l
     cw, ok, _ = code.decode(de)
     u = code.extract(cw)[: (code.k // 8) * 8]
     return np.packbits(u).tobytes(), ok
+
+
+def decode_digital_block(blk: EqualisedBlock, mode: int, p: ModemParams = DEFAULT) -> Tuple[bytes, bool]:
+    return decode_digital_group([blk], mode, p)
 
 
 def encode_analog_block(values: np.ndarray, p: ModemParams = DEFAULT) -> np.ndarray:
@@ -258,15 +275,17 @@ class SuperframePlan:
     analog_values: int
     digital_blocks: List[int]
     analog_blocks: List[int]
+    groups: List[List[int]]     # digital blocks coded together (one LDPC codeword each)
 
 
 def plan(header: Header, p: ModemParams = DEFAULT) -> SuperframePlan:
     dig, ana = [], []
     for b in range(1, p.blocks_per_sf):
         (ana if (header.block_types >> b) & 1 else dig).append(b)
-    return SuperframePlan(block_capacity_bytes(HEADER_MODE, p),
-                          len(dig) * block_capacity_bytes(header.dig_mode, p),
-                          len(ana) * 2 * p.data_sym_per_block, dig, ana)
+    groups = [dig] if (header.long_code and dig) else [[b] for b in dig]
+    payload = sum(block_capacity_bytes(header.dig_mode, p, len(g)) for g in groups)
+    return SuperframePlan(block_capacity_bytes(HEADER_MODE, p), payload,
+                          len(ana) * 2 * p.data_sym_per_block, dig, ana, groups)
 
 
 def build_superframe(header: Header, packets: List[bytes], analog_values: np.ndarray,
@@ -282,9 +301,12 @@ def build_superframe(header: Header, packets: List[bytes], analog_values: np.nda
     area = area.ljust(pl.payload_bytes, b"\0")
     blocks = [build_pilot_block(p)]
     syms = {0: encode_digital_block(area0.ljust(pl.header_bytes, b"\0"), HEADER_MODE, p)}
-    cap = block_capacity_bytes(header.dig_mode, p)
-    for i, b in enumerate(pl.digital_blocks):
-        syms[b] = encode_digital_block(area[i * cap:(i + 1) * cap], header.dig_mode, p)
+    pos = 0
+    for g in pl.groups:
+        cap = block_capacity_bytes(header.dig_mode, p, len(g))
+        for b, s in zip(g, encode_digital_group(area[pos:pos + cap], header.dig_mode, len(g), p)):
+            syms[b] = s
+        pos += cap
     nv = 2 * p.data_sym_per_block
     for i, b in enumerate(pl.analog_blocks):
         syms[b] = encode_analog_block(analog_values[i * nv:(i + 1) * nv], p)
@@ -326,9 +348,9 @@ def decode_superframe(blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
     pl = plan(header, p)
     area = bytearray()
     n_ok = 1 if hdr_ok else 0
-    for b in pl.digital_blocks:
-        data, ok = decode_digital_block(blocks[b], header.dig_mode, p)
-        n_ok += 1 if ok else 0
+    for g in pl.groups:
+        data, ok = decode_digital_group([blocks[b] for b in g], header.dig_mode, p)
+        n_ok += len(g) if ok else 0
         area += data
     vals, noise = [], []
     for b in pl.analog_blocks:

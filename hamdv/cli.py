@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .params import DEFAULT, MODE_BY_NAME
+from .params import DEFAULT, MODE_BY_NAME, PROFILES, BAUD_PROFILE
 from .tx import Transmitter, TxConfig
 from .rx import Receiver, FrameInfo
 from .channel import simulate, ChannelConfig
@@ -37,13 +37,17 @@ def add_media_args(ap: argparse.ArgumentParser):
     ap.add_argument("--text", default=None, help="short station text sent with every superframe")
     ap.add_argument("--video", default="test", help="video source: 'test', camera index, video file or image")
     ap.add_argument("--audio", default="synth", help="audio source: 'synth', 'mic', 'none' or a .wav file")
+    ap.add_argument("--baud", type=int, default=1600, choices=[1600, 2000, 4000],
+                    help="1600/2000: voice channel (mic/speaker path, repeater); 4000: flat 9600-baud data port (16 kHz audio)")
+    ap.add_argument("--long-code", action="store_true", help="one LDPC codeword per superframe (~1 dB gain, all-or-nothing)")
 
 
 def make_tx(args) -> Transmitter:
     w, h = _size(args.size)
     cfg = TxConfig(callsign=args.callsign, width=w, height=h, frames_per_sf=args.frames_per_sf,
                    audio_mode=args.audio_rate, dig_mode=args.mode, analog=args.analog,
-                   analog_blocks=args.analog_blocks, refresh=args.refresh, level=args.level, text=args.text)
+                   analog_blocks=args.analog_blocks, refresh=args.refresh, level=args.level, text=args.text,
+                   baud=args.baud, long_code=args.long_code)
     return Transmitter(cfg)
 
 
@@ -60,9 +64,10 @@ def generate_transmission(tx: Transmitter, video: VideoSource, audio_src: np.nda
             t = (s * tx.cfg.frames_per_sf + i) / fps
             f = video.read(t)
             frames.append(f)
-        a = audio_src[s * tx.sf_samples:(s + 1) * tx.sf_samples] if tx.aenc is not None else np.zeros(0)
-        if tx.aenc is not None and len(a) < tx.sf_samples:
-            a = np.concatenate([a, np.zeros(tx.sf_samples - len(a))])
+        na = tx.sf_audio_samples
+        a = audio_src[s * na:(s + 1) * na] if tx.aenc is not None else np.zeros(0)
+        if tx.aenc is not None and len(a) < na:
+            a = np.concatenate([a, np.zeros(na - len(a))])
         parts.append(tx.superframe(a, frames, last=(s == n_sf - 1)))
         if sent_frames is not None:
             sent_frames.extend(f for f, ok in zip(frames, tx.last_sent_mask) if ok)
@@ -150,6 +155,7 @@ class FrameSink:
 
 def report(rx: Receiver, sink: FrameSink, originals: Optional[List[np.ndarray]] = None):
     s = rx.status
+    print(f"  profile {s['profile'] or '-'} ({s['baud']} Bd)")
     print(f"  station {s['callsign']!r}  SNR {s['snr_db']:.1f} dB  superframes OK {s['sf_ok']}/{s['sf_total']}  "
           f"blocks OK {s['blocks_ok']}/{s['blocks_total']}  frames {s['frames']}  audio frames {s['audio_frames']}  "
           f"drift {s['sro_ppm']:+.0f} ppm")
@@ -169,21 +175,24 @@ def cmd_sim(args):
     video = VideoSource(args.video, w, h)
     audio_src = load_audio_source(args.audio, args.seconds)
     sent = []
-    print(f"HamDV simulation: {args.mode}, {w}x{h}, {'analog' if args.analog else 'digital'} video, "
-          f"audio {args.audio_rate} bps, channel SNR {args.snr} dB, drift {args.sro} ppm")
+    flat = args.flat or args.baud == 4000
+    print(f"HamDV simulation: {args.baud} Bd{' long code' if args.long_code else ''}, {args.mode}, {w}x{h}, "
+          f"{'analog' if args.analog else 'digital'} video, audio {args.audio_rate} bps, "
+          f"{'flat 9600-port' if flat else 'voice repeater'} channel, SNR {args.snr} dB, drift {args.sro} ppm")
     t0 = time.time()
     tx_audio = generate_transmission(tx, video, audio_src, args.seconds, sent)
     t_enc = time.time() - t0
-    rx_audio = simulate(tx_audio, ChannelConfig(snr_db=args.snr, sro_ppm=args.sro, limiter_drive=args.limiter,
-                                                id_tone=args.id_tone, impulse_rate=args.impulses, seed=args.seed))
+    rx_audio = simulate(tx_audio, ChannelConfig(fs=tx.p.fs, flat=flat, snr_db=args.snr, sro_ppm=args.sro,
+                                                limiter_drive=args.limiter, id_tone=args.id_tone,
+                                                impulse_rate=args.impulses, seed=args.seed))
     sink = FrameSink(args.out_dir)
     audio_out = []
     rx = Receiver(verbose=args.verbose, on_frame=sink, on_audio=audio_out.append,
-                  on_text=lambda c, t: None)
+                  on_text=lambda c, t: None, fs_in=tx.p.fs)
     t0 = time.time()
     for i in range(0, len(rx_audio), 4000):
         rx.feed(rx_audio[i:i + 4000])
-    rx.feed(np.zeros(16000))
+    rx.feed(np.zeros(2 * tx.p.fs))
     t_dec = time.time() - t0
     fps = tx.cfg.frames_per_sf / tx.sf_seconds
     sink.finish(fps, sent)
@@ -200,10 +209,10 @@ def cmd_sim(args):
             ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"))
             ww.write(np.concatenate(audio_out))
             ww.close()
-        ww = WavWriter(os.path.join(args.out_dir, "tx_audio.wav"))
+        ww = WavWriter(os.path.join(args.out_dir, "tx_audio.wav"), tx.p.fs)
         ww.write(tx_audio)
         ww.close()
-        ww = WavWriter(os.path.join(args.out_dir, "rx_audio.wav"))
+        ww = WavWriter(os.path.join(args.out_dir, "rx_audio.wav"), tx.p.fs)
         ww.write(rx_audio / max(1.0, np.abs(rx_audio).max()))
         ww.close()
         print(f"  outputs written to {args.out_dir}/ (rx_*.png, contact_sheet.png, original_vs_received.png, received.mp4, "
@@ -217,22 +226,22 @@ def cmd_encode(args):
     video = VideoSource(args.video, w, h)
     audio_src = load_audio_source(args.audio, args.seconds)
     tx_audio = generate_transmission(tx, video, audio_src, args.seconds)
-    ww = WavWriter(args.out)
+    ww = WavWriter(args.out, tx.p.fs)
     ww.write(tx_audio)
     ww.close()
-    print(f"wrote {args.out}: {len(tx_audio)/8000:.1f} s, {tx.stats['sf']} superframes")
+    print(f"wrote {args.out}: {len(tx_audio)/tx.p.fs:.1f} s at {tx.p.fs} Hz, {tx.stats['sf']} superframes, {args.baud} Bd")
 
 
 def cmd_decode(args):
     from .audioio import read_wav, WavWriter
-    rx_audio = read_wav(args.inp)
+    rx_audio = read_wav(args.inp, 16000)
     sink = FrameSink(args.out_dir)
     audio_out = []
     rx = Receiver(verbose=args.verbose, on_frame=sink, on_audio=audio_out.append,
-                  on_text=lambda c, t: print(f"  [{c}] {t}"))
-    for i in range(0, len(rx_audio), 4000):
-        rx.feed(rx_audio[i:i + 4000])
-    rx.feed(np.zeros(16000))
+                  on_text=lambda c, t: print(f"  [{c}] {t}"), fs_in=16000)
+    for i in range(0, len(rx_audio), 8000):
+        rx.feed(rx_audio[i:i + 8000])
+    rx.feed(np.zeros(32000))
     sink.finish(sink.fps)
     report(rx, sink)
     if args.out_dir and audio_out:
@@ -252,20 +261,21 @@ def cmd_tx(args):
     w, h = _size(args.size)
     video = VideoSource(args.video, w, h)
     if args.out_wav:
-        out = WavWriter(args.out_wav)
+        out = WavWriter(args.out_wav, tx.p.fs)
     else:
-        out = AudioOutput(device=args.out_device, fs_dev=args.device_rate)
+        out = AudioOutput(device=args.out_device, fs_dev=args.device_rate, fs_internal=tx.p.fs)
     mic = None
     file_audio = None
     if tx.aenc is not None:
         if args.audio == "mic":
-            mic = AudioInput(device=args.in_device, fs_dev=args.device_rate)
+            mic = AudioInput(device=args.in_device, fs_dev=args.device_rate, fs_internal=8000)
         else:
             file_audio = load_audio_source(args.audio, args.seconds or 3600)
     ptt = PTT(args.ptt)
     fps = tx.cfg.frames_per_sf / tx.sf_seconds
-    print(f"HamDV TX {tx.cfg.callsign}: {args.mode}, {w}x{h} {'analog' if args.analog else 'digital'} video "
-          f"{fps:.1f} fps, audio {args.audio_rate} bps. Ctrl-C to stop.")
+    print(f"HamDV TX {tx.cfg.callsign}: {args.baud} Bd {args.mode}{' long code' if args.long_code else ''}, {w}x{h} "
+          f"{'analog' if args.analog else 'digital'} video {fps:.1f} fps, audio {args.audio_rate} bps"
+          f"{' (flat 9600-port audio)' if args.baud == 4000 else ''}. Ctrl-C to stop.")
     stop = threading.Event()
     t_start = time.time()
     sf_counter = 0
@@ -286,12 +296,13 @@ def cmd_tx(args):
                         while time.time() < target:
                             time.sleep(0.01)
                     frames.append(video.read((sf_counter * tx.cfg.frames_per_sf + i) / fps))
+                na = tx.sf_audio_samples
                 if mic is not None:
-                    a = mic.read(tx.sf_samples)
+                    a = mic.read(na)
                 elif file_audio is not None:
-                    a = file_audio[sf_counter * tx.sf_samples:(sf_counter + 1) * tx.sf_samples]
-                    if len(a) < tx.sf_samples:
-                        a = np.concatenate([a, np.zeros(tx.sf_samples - len(a))])
+                    a = file_audio[sf_counter * na:(sf_counter + 1) * na]
+                    if len(a) < na:
+                        a = np.concatenate([a, np.zeros(na - len(a))])
                 else:
                     a = np.zeros(0)
                 sf_counter += 1
@@ -348,20 +359,20 @@ def cmd_rx(args):
             spk.write(samples * args.volume)
 
     rx = Receiver(verbose=args.verbose, on_frame=on_frame, on_audio=on_audio,
-                  on_text=lambda c, t: print(f"\n  [{c}] {t}"))
+                  on_text=lambda c, t: print(f"\n  [{c}] {t}"), fs_in=16000)
     if args.in_wav:
-        src = read_wav(args.in_wav)
+        src = read_wav(args.in_wav, 16000)
         print(f"HamDV RX from {args.in_wav}")
-        for i in range(0, len(src), 4000):
-            rx.feed(src[i:i + 4000])
+        for i in range(0, len(src), 8000):
+            rx.feed(src[i:i + 8000])
             if viewer:
                 viewer.update_status(rx.status)
             if spk is not None:
                 while spk.pending_seconds() > 1.0:
                     time.sleep(0.05)
-        rx.feed(np.zeros(16000))
+        rx.feed(np.zeros(32000))
     else:
-        mic = AudioInput(device=args.in_device, fs_dev=args.device_rate)
+        mic = AudioInput(device=args.in_device, fs_dev=args.device_rate, fs_internal=16000)
         print(f"HamDV RX listening on audio device {args.in_device}" + (f", viewer at http://localhost:{args.http}/" if viewer else "") + ". Ctrl-C to stop.")
         try:
             while True:
@@ -369,7 +380,7 @@ def cmd_rx(args):
                 if viewer:
                     viewer.update_status(rx.status)
                 s = rx.status
-                print(f"\r  {s['state']:9s} {s['callsign']:8s} SNR {s['snr_db']:5.1f} dB  SF {s['sf_ok']}/{s['sf_total']}  frames {s['frames']}   ", end="", flush=True)
+                print(f"\r  {s['state']:9s} {s['profile'] or '':8s} {s['callsign']:8s} SNR {s['snr_db']:5.1f} dB  SF {s['sf_ok']}/{s['sf_total']}  frames {s['frames']}   ", end="", flush=True)
                 time.sleep(0.05)
         except KeyboardInterrupt:
             print("\nstopping")
@@ -396,6 +407,7 @@ def main(argv=None):
     s.add_argument("--id-tone", action="store_true", help="mix a repeater CW ID over the signal")
     s.add_argument("--impulses", type=float, default=0.0, help="impulse noise events per second")
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--flat", action="store_true", help="model the flat 9600-port path instead of the voice repeater")
     s.add_argument("--out-dir", default=None, help="write received frames, contact sheet, mp4 and wav files here")
     s.add_argument("--verbose", action="store_true")
     s.set_defaults(func=cmd_sim)

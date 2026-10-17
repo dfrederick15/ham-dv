@@ -7,10 +7,11 @@ from typing import List, Optional
 
 import numpy as np
 
-from .framing import (Header, FLAG_LAST, FLAG_ANALOG_VIDEO, AUDIO_MODE_IDX, PKT_AUDIO, PKT_VIDEO, PKT_VMETA,
-                      PKT_TEXT, PKT_INFO, pack_packet, plan, build_superframe)
+from .framing import (Header, FLAG_LAST, FLAG_ANALOG_VIDEO, FLAG_LONGCODE, AUDIO_MODE_IDX, PKT_AUDIO, PKT_VIDEO,
+                      PKT_VMETA, PKT_TEXT, PKT_INFO, pack_packet, plan, build_superframe)
 from .modem import Modulator, preamble_symbols
-from .params import ModemParams, DEFAULT, MODE_BY_NAME
+from .params import ModemParams, DEFAULT, MODE_BY_NAME, PROFILES, BAUD_PROFILE
+from .vocoder import FS as AUDIO_FS
 from .softvideo import SoftEncoder, SoftConfig, pack_meta
 from .videocodec import VideoEncoder
 from .vocoder import VocoderEncoder, pack_frames, FRAME as AFRAME
@@ -32,11 +33,15 @@ class TxConfig:
     level: float = 0.25               # TX audio RMS level (0..1 full scale)
     text: Optional[str] = None        # station text sent once per superframe
     keyup_s: float = 0.4              # silence after PTT before the preamble (repeater key-up)
+    baud: int = 1600                  # 1600 / 2000 (voice channel) or 4000 (flat 9600-baud data port)
+    long_code: bool = False           # one LDPC codeword over all digital payload blocks (~1 dB gain)
 
 
 class Transmitter:
-    def __init__(self, cfg: TxConfig, p: ModemParams = DEFAULT):
+    def __init__(self, cfg: TxConfig, p: Optional[ModemParams] = None):
         self.cfg = cfg
+        if p is None:
+            p = PROFILES[BAUD_PROFILE[cfg.baud]]
         self.p = p
         if cfg.width % 8 or cfg.height % 8:
             raise ValueError("video size must be a multiple of 8")
@@ -62,7 +67,7 @@ class Transmitter:
         pl = plan(self.header(), p)
         need = 0
         if self.aenc is not None:
-            need += 7 + (int(np.ceil(p.sf_samples / AFRAME)) * self.aenc.bits_per_frame + 7) // 8
+            need += 7 + (int(np.ceil(self.sf_audio_samples / AFRAME)) * self.aenc.bits_per_frame + 7) // 8
         if cfg.text:
             need += 5 + min(len(cfg.text.encode("utf-8")), 120)
         if need > pl.payload_bytes:
@@ -75,7 +80,13 @@ class Transmitter:
     # ----------------------------------------------------------------- sizes
     @property
     def sf_samples(self) -> int:
+        """Modem output samples per superframe (at p.fs)."""
         return self.p.sf_samples
+
+    @property
+    def sf_audio_samples(self) -> int:
+        """Microphone samples (8 kHz) consumed per superframe."""
+        return int(round(self.p.sf_seconds * AUDIO_FS))
 
     @property
     def sf_seconds(self) -> float:
@@ -83,7 +94,8 @@ class Transmitter:
 
     def header(self, last: bool = False) -> Header:
         c = self.cfg
-        flags = (FLAG_LAST if last else 0) | (FLAG_ANALOG_VIDEO if c.analog else 0)
+        flags = ((FLAG_LAST if last else 0) | (FLAG_ANALOG_VIDEO if c.analog else 0)
+                 | (FLAG_LONGCODE if c.long_code else 0))
         fps_x10 = int(round(10 * c.frames_per_sf / self.p.sf_seconds))
         return Header(c.callsign, self.tx_id, self.sf_seq, flags, self.dig_mode, self.block_types,
                       c.width, c.height, fps_x10, AUDIO_MODE_IDX[c.audio_mode], c.frames_per_sf, c.refresh)
