@@ -68,7 +68,13 @@ DIGITAL_MODES = {
     3: ("16qam-3/4", 4, 3, 4),
     4: ("64qam-1/2", 6, 1, 2),
     5: ("64qam-3/4", 6, 3, 4),
+    6: ("256qam-3/4", 8, 3, 4),        # uniform 256-QAM
+    7: ("256qam-s4.5", 8, 3, 4),       # probabilistically shaped, 4.5 user bits/symbol
+    8: ("256qam-s5.0", 8, 3, 4),
+    9: ("256qam-s5.5", 8, 3, 4),
 }
+# shaped modes: user bits per symbol (amplitudes carry the data, sign bits carry the LDPC parity)
+PAS_RATES = {7: 4.5, 8: 5.0, 9: 5.5}
 MODE_BY_NAME = {v[0]: k for k, v in DIGITAL_MODES.items()}
 HEADER_MODE = 0          # block 0 of every superframe always uses the most robust mode
 

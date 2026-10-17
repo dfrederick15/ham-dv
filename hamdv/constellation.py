@@ -48,19 +48,23 @@ def map_bits(bits: np.ndarray, bits_per_symbol: int) -> np.ndarray:
     return pts[lut[idx]]
 
 
-def llrs(sym: np.ndarray, bits_per_symbol: int, noise_var: float) -> np.ndarray:
+def llrs(sym: np.ndarray, bits_per_symbol: int, noise_var: float, points=None, log_prior=None) -> np.ndarray:
     """Max-log LLRs (positive favours bit 0) for received symbols.
 
-    LLR_j = (min_{s: b_j(s)=1} |y-s|^2 - min_{s: b_j(s)=0} |y-s|^2) / sigma^2
+    LLR_j = max_{s: b_j(s)=0} [-|y-s|^2/sigma^2 + log P(s)] - max_{s: b_j(s)=1} [...]
+    With a uniform prior this is the usual (d1 - d0)/sigma^2.  `points` / `log_prior`
+    override the constellation for probabilistically shaped modes.
     """
     pts, labels = constellation(bits_per_symbol)
-    d2 = np.abs(sym[:, None] - pts[None, :]) ** 2    # (n, M)
+    if points is not None:
+        pts = points
+    metric = -np.abs(sym[:, None] - pts[None, :]) ** 2 / max(noise_var, 1e-6)    # (n, M)
+    if log_prior is not None:
+        metric = metric + log_prior[None, :]
     out = np.empty((len(sym), bits_per_symbol))
     for j in range(bits_per_symbol):
         mask0 = labels[:, j] == 0
-        d0 = np.min(d2[:, mask0], axis=1)
-        d1 = np.min(d2[:, ~mask0], axis=1)
-        out[:, j] = (d1 - d0) / max(noise_var, 1e-6)
+        out[:, j] = np.max(metric[:, mask0], axis=1) - np.max(metric[:, ~mask0], axis=1)
     return out.reshape(-1)
 
 

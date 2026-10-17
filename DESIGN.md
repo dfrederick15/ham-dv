@@ -167,6 +167,66 @@ Max-log LLRs: $\Lambda_j = \big(\min_{s: b_j(s)=1}|y-s|^2 - \min_{s: b_j(s)=0}|y
 Codeword bits are interleaved by a fixed pseudo-random permutation before
 mapping so a cluster of bad symbols does not hit adjacent code bits.
 
+### 4.4 Strong-signal modes: 256-QAM with probabilistic amplitude shaping
+
+Square 256-QAM is 16-PAM per axis: one sign bit and one of eight amplitudes
+$a \in \{1,3,\dots,15\}$.  Used uniformly, the outer points spend a lot of
+power for little information; a Gaussian-like distribution over the points
+is up to $\tfrac{\pi e}{6}$ (1.53 dB) more efficient.  HamDV implements
+probabilistic amplitude shaping (Böcherer, Steiner, Schulte 2015):
+
+1. **Target distribution.**  Amplitudes are sent with the Maxwell–Boltzmann
+   distribution $P(a) = e^{-\nu a^2}/\sum_{a'} e^{-\nu a'^2}$, the
+   maximum-entropy distribution for a given mean power.  $\nu$ sets the
+   information rate continuously; three operating points are defined
+   (4.5, 5.0 and 5.5 user bits per symbol).
+
+2. **Distribution matcher.**  A block of $n = 496$ amplitudes (248 symbols ×
+   2 axes) has a fixed *composition* $(n_0,\dots,n_7)$, $\sum n_a = n$,
+   obtained by quantising $nP(a)$.  The number of sequences with that
+   composition is the multinomial coefficient $M = n!/\prod_a n_a!$, and
+   $k = \lfloor \log_2 M\rfloor$ user bits select one by enumerative coding:
+   reading the bits as an integer $r < 2^k$, the sequence is *unranked*
+   symbol by symbol, where the number of completions that start with
+   amplitude $a'$ given the remaining composition is
+   $M_{rem}\, n_{a'}/n_{rem}$ (an exact integer).  The inverse (ranking) sums
+   the completion counts of all smaller amplitudes at each position.  With
+   arbitrary-precision integers the matcher is exact and perfectly
+   invertible; the rate loss relative to the entropy $H(P)$ is about 0.05 bit
+   per amplitude at $n = 496$.  Compositions for the three rates are fixed in
+   `shaping.py`; the strongest shaping whose $\log_2 M$ still admits $k$ bits is
+   chosen by bisection on $\nu$:
+
+   | user bits/symbol | $k$ per block | composition $n_0..n_7$ | $H(A)$ | power saving vs. uniform |
+   |---|---|---|---|---|
+   | 4.5 | 1116 | 161 136 96 57 29 12 4 1 | 2.30 bit | 5.7 dB |
+   | 5.0 | 1240 | 134 119 94 67 42 23 12 5 | 2.55 bit | 4.2 dB |
+   | 5.5 | 1364 | 104 98 86 71 54 39 27 17 | 2.81 bit | 2.4 dB |
+
+3. **Systematic code, parity on the signs.**  The amplitude labels (the 3
+   low bits of the reflected Gray code, identical for $\pm a$) are the 1488
+   information bits of the systematic rate-3/4 LDPC code with $n = 1984$; its
+   496 parity bits are placed on the sign bits (the Gray MSB) of the 248
+   symbols.  Parity bits are uniform, so the signs are uniform and the
+   amplitude distribution is untouched.  The constellation is rescaled so
+   the *shaped* average power is 1.
+
+4. **Demapping with priors.**  The receiver computes max-log LLRs with the
+   symbol prior,
+   $\Lambda_j = \max_{s:b_j=0}\big[-|y-s|^2/\sigma^2 + \log P(s)\big] - \max_{s:b_j=1}[\cdot]$,
+   $P(s) = P(a_I)P(a_Q)/4$; after LDPC decoding the amplitude labels are
+   mapped back to amplitudes and *ranked* to recover the user bits.  A
+   decoded sequence whose composition is wrong flags the block as failed.
+
+Measured thresholds (AWGN, frame-error-free): 64-QAM-3/4 16 dB,
+256-QAM-s4.5 16 dB, s5.0 18 dB, s5.5 19 dB, uniform 256-QAM-3/4 22 dB; add
+about 2 dB through the modelled repeater chain.  The shaped modes also pass
+the modelled microphone limiter (drive 0.5) that breaks uniform 256-QAM:
+the outer points are transmitted so rarely that clipping them costs little.
+Peak-to-average ratio of the shaped symbol stream is 7.2 dB versus 4.3 dB
+for uniform 256-QAM, but the *audio* PAPR after pulse shaping is unchanged
+(8.7–8.9 dB) because the RRC filter dominates it.
+
 ## 5. Link layer
 
 Block 0 of every superframe is always QPSK rate-1/2 and carries the
@@ -331,6 +391,11 @@ Lost frames are concealed by fading the previous parameters.
 * LDPC: p = 31, column weight 3, seeds 1234 + 1000·bc + br (see `ldpc.py`),
   interleaver = NumPy default_rng(0xC0DE + n).permutation(n).
 * Constellations: Gray square QAM, unit power; header block mode 0.
+* Shaped modes 7–9: compositions in `shaping.PAS_TABLE`; amplitude slot
+  $j$ (0..1487) = amplitude $j/3$ → symbol $(j/3)/2$, axis $(j/3) \bmod 2$, label
+  bit $1 + j \bmod 3$ (+4 for Q); the first 1488 free columns of the LDPC code
+  in ascending order are the amplitude slots, the pivot columns in ascending
+  order are the sign slots (symbol $s/2$, axis $s \bmod 2$).
 * Packets and header fields: see `framing.py`.
 * Video codec syntax: see `videocodec.py` (contexts in class `Ctx`).
 * Analog transport: see `softvideo.py` (chunk rectangles in `SoftConfig.rects`).

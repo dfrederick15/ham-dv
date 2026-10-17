@@ -78,3 +78,10 @@ def test_64qam_full_quieting():
     tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=3, snr_db=30, limiter_drive=0.3)
     assert rx.status["sf_ok"] == 3, rx.status
     assert len(got) >= 7
+
+
+def test_256qam_shaped_strong_signal():
+    cfg = TxConfig(callsign="K4OZI", dig_mode="256qam-s5.5", width=128, height=96, frames_per_sf=4)
+    tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=3, snr_db=32, limiter_drive=0.2)
+    assert rx.status["sf_ok"] == 3, rx.status
+    assert len(got) >= 9

@@ -98,6 +98,26 @@ the receivers follow whoever is keyed.
 | 16qam-3/4    | 651                                 | 11 dB       |
 | 64qam-1/2    | 651                                 | 13 dB       |
 | 64qam-3/4    | 973                                 | 17 dB       |
+| 256qam-s4.5  | 973                                 | 16 dB       |
+| 256qam-s5.0  | 1085                                | 18 dB       |
+| 256qam-s5.5  | 1190                                | 20 dB       |
+| 256qam-3/4   | 1302                                | 22 dB, clean audio path only |
+
+The `256qam-s*` modes are the **strong-signal modes with probabilistic
+amplitude shaping**: 256-QAM whose amplitudes follow a Maxwell–Boltzmann
+distribution produced by an exact enumerative distribution matcher, with the
+LDPC parity carried on the sign bits (see DESIGN.md §4.4).  They fill the
+6 dB gap between 64-QAM and uniform 256-QAM in finer rate steps, gain about
+1 dB over a uniform constellation at the same rate, and because the outer
+points are sent rarely they tolerate a radio's microphone limiter where
+uniform 256-QAM does not.  Example at 128×96, 4 frames per superframe:
+
+| mode | video bit rate (with 1200 bit/s voice) | PSNR, test scene |
+|------|-----------------------------------------|------------------|
+| 64qam-3/4   | 3.2 kbit/s | 28.0 dB |
+| 256qam-s5.0 | 3.6 kbit/s | 29.1 dB |
+| 256qam-s5.5 | 4.2 kbit/s | 29.9 dB |
+| 256qam-3/4  | 4.7 kbit/s | 30.5 dB |
 
 A superframe lasts 1.53 s.  Voice at 1200 bit/s costs 237 bytes of it; the
 rest goes to video.  Block 0 of every superframe is always QPSK rate-1/2 and
@@ -121,7 +141,8 @@ through a repeater typically gives 25–35 dB audio SNR, enough for 64-QAM.
 hamdv/dsp.py          pulse shaping, Zadoff-Chu, Hadamard, polyphase interpolation, DCT
 hamdv/modem.py        SC-FDE modulator / demodulator (sync, channel estimation, MMSE equaliser)
 hamdv/ldpc.py         QC-LDPC construction, GF(2) encoder, min-sum decoder
-hamdv/constellation.py QAM mapping and max-log LLRs
+hamdv/constellation.py QAM mapping and max-log LLRs (with shaping priors)
+hamdv/shaping.py      probabilistic amplitude shaping: enumerative distribution matcher, 256-QAM PAS modes
 hamdv/framing.py      superframes, header, packets, CRC, block coding
 hamdv/videocodec.py   digital video codec (integer DCT, motion, RDO, arithmetic coding)
 hamdv/softvideo.py    analog video transport (3-D DCT, power allocation, Hadamard, LLSE)

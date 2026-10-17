@@ -27,7 +27,8 @@ import numpy as np
 from .constellation import map_bits, llrs
 from .ldpc import get_code
 from .modem import build_data_block, build_pilot_block, preamble_symbols, EqualisedBlock
-from .params import ModemParams, DEFAULT, DIGITAL_MODES, HEADER_MODE
+from .params import ModemParams, DEFAULT, DIGITAL_MODES, HEADER_MODE, PAS_RATES
+from .shaping import pas_mode, AMPS_PER_BLOCK
 
 MAGIC = b"HV"
 VERSION = 1
@@ -143,13 +144,47 @@ def mode_code(mode: int, p: ModemParams = DEFAULT):
     return get_code(n, rn, rd), bps
 
 
+@lru_cache(maxsize=None)
+def pas_layout(mode: int, p: ModemParams = DEFAULT):
+    """Column -> (symbol, bit) assignment for a shaped mode.
+
+    The first 3 x 496 free (information) columns of the systematic LDPC code
+    carry the amplitude labels, the parity columns (and any surplus free
+    columns, which carry plain user bits) land on the two sign bits of each
+    symbol.  Returns (code, pas, amp_cols, extra_cols, sym_bit_of_col (n, 2)).
+    """
+    code, bps = mode_code(mode, p)
+    pas = pas_mode(PAS_RATES[mode])
+    n_amp_bits = 3 * AMPS_PER_BLOCK
+    if code.k < n_amp_bits:
+        raise RuntimeError("LDPC code too weak for PAS layout")
+    amp_cols = code.free_cols[:n_amp_bits]
+    extra_cols = code.free_cols[n_amp_bits:]
+    sign_cols = np.concatenate([code.pivot_cols, extra_cols])
+    sym_bit = np.zeros((code.n, 2), dtype=np.int64)
+    # amplitude slot j: amplitude index i = j // 3 -> symbol i // 2, dimension i % 2, bit 1..3 or 5..7
+    j = np.arange(n_amp_bits)
+    i = j // 3
+    sym_bit[amp_cols, 0] = i // 2
+    sym_bit[amp_cols, 1] = 1 + (j % 3) + 4 * (i % 2)
+    s = np.arange(len(sign_cols))
+    sym_bit[sign_cols, 0] = s // 2
+    sym_bit[sign_cols, 1] = 4 * (s % 2)
+    return code, pas, amp_cols, extra_cols, sym_bit
+
+
 def block_capacity_bytes(mode: int, p: ModemParams = DEFAULT) -> int:
+    if mode in PAS_RATES:
+        code, pas, amp_cols, extra_cols, _ = pas_layout(mode, p)
+        return (pas.k_dm + len(extra_cols)) // 8
     code, _ = mode_code(mode, p)
     return code.k // 8
 
 
 def encode_digital_block(data: bytes, mode: int, p: ModemParams = DEFAULT) -> np.ndarray:
     """bytes (<= capacity) -> 248 QAM symbols."""
+    if mode in PAS_RATES:
+        return _encode_pas_block(data, mode, p)
     code, bps = mode_code(mode, p)
     bits = np.unpackbits(np.frombuffer(data.ljust(code.k // 8, b"\0"), dtype=np.uint8))
     u = np.zeros(code.k, dtype=np.uint8)
@@ -159,7 +194,35 @@ def encode_digital_block(data: bytes, mode: int, p: ModemParams = DEFAULT) -> np
     return map_bits(cw, bps)
 
 
+def _encode_pas_block(data: bytes, mode: int, p: ModemParams) -> np.ndarray:
+    code, pas, amp_cols, extra_cols, sym_bit = pas_layout(mode, p)
+    cap = (pas.k_dm + len(extra_cols)) // 8
+    bits = np.unpackbits(np.frombuffer(data.ljust(cap, b"\0")[:cap], dtype=np.uint8))
+    bits = np.concatenate([bits, np.zeros(pas.k_dm + len(extra_cols) - len(bits), dtype=np.uint8)])
+    u = np.zeros(code.k, dtype=np.uint8)
+    u[: 3 * AMPS_PER_BLOCK] = pas.amplitude_bits(bits[: pas.k_dm])     # shaped amplitudes = info bits
+    u[3 * AMPS_PER_BLOCK:] = bits[pas.k_dm: pas.k_dm + len(extra_cols)]
+    cw = code.encode(u)
+    labels = np.zeros((p.data_sym_per_block, 8), dtype=np.uint8)
+    labels[sym_bit[:, 0], sym_bit[:, 1]] = cw
+    return pas.map_labels(labels)
+
+
+def _decode_pas_block(blk: EqualisedBlock, mode: int, p: ModemParams) -> Tuple[bytes, bool]:
+    code, pas, amp_cols, extra_cols, sym_bit = pas_layout(mode, p)
+    l = llrs(blk.symbols, 8, blk.noise_var, points=pas.points, log_prior=pas.log_prior).reshape(-1, 8)
+    col_llr = l[sym_bit[:, 0], sym_bit[:, 1]]
+    cw, ok, _ = code.decode(col_llr)
+    u = code.extract(cw)
+    user, comp_ok = pas.user_bits(u[: 3 * AMPS_PER_BLOCK])
+    bits = np.concatenate([user, u[3 * AMPS_PER_BLOCK:]])
+    cap = (pas.k_dm + len(extra_cols)) // 8
+    return np.packbits(bits[: cap * 8]).tobytes(), ok and comp_ok
+
+
 def decode_digital_block(blk: EqualisedBlock, mode: int, p: ModemParams = DEFAULT) -> Tuple[bytes, bool]:
+    if mode in PAS_RATES:
+        return _decode_pas_block(blk, mode, p)
     code, bps = mode_code(mode, p)
     l = llrs(blk.symbols, bps, blk.noise_var)
     de = np.empty_like(l)
