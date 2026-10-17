@@ -107,3 +107,22 @@ def test_flat_9600_port_4000_baud():
     assert rx.status["profile"] == "flat", rx.status
     assert rx.status["sf_ok"] == 3, rx.status
     assert len(got) >= 14
+
+
+def test_hf_ssb_fading_and_mistuning():
+    cfg = TxConfig(callsign="K4OZI", profile="ssb", dig_mode="qpsk-3/4", width=64, height=48, frames_per_sf=2,
+                   audio_mode=0, long_code=True)
+    tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=6, snr_db=14, hf="ssb", hf_condition="good",
+                                                     cfo_hz=-85.0, sro_ppm=60)
+    assert rx.status["profile"] == "ssb", rx.status
+    assert abs(rx.status["cfo_hz"] + 85.0) < 1.5, rx.status["cfo_hz"]
+    assert rx.status["sf_ok"] >= 5, rx.status
+    assert len(got) >= 8
+
+
+def test_hf_am_envelope_detector():
+    cfg = TxConfig(callsign="K4OZI", profile="am", dig_mode="16qam-3/4", width=96, height=72, frames_per_sf=3)
+    tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=4, snr_db=22, hf="am", hf_condition="none")
+    assert rx.status["profile"] == "am", rx.status
+    assert rx.status["sf_ok"] == 4, rx.status
+    assert len(got) >= 9

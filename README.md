@@ -101,6 +101,49 @@ so `--baud 4000` is mainly for simplex or data-capable repeaters.
 Discriminator noise rises with frequency, so a few dB more signal is needed
 than the band-average SNR suggests.
 
+### HF: `--profile ssb` and `--profile am`
+
+| profile | symbol rate | audio band | designed for |
+|---------|-------------|------------|--------------|
+| `ssb` | 1333 Bd | 633–2367 Hz (fits a 2.4 kHz SSB filter) | HF single sideband: ±150 Hz mistuning, drift, ionospheric multipath and fading |
+| `am`  | 2000 Bd | 500–3100 Hz | HF (or any) AM with an envelope or synchronous detector |
+
+**SSB.**  Feed the transceiver's mic/line input and take audio from its
+line/speaker output as for any digital mode.  Set the drive so ALC barely
+moves (the waveform has a 9 dB peak-to-average ratio; the shaped and
+analog modes need a linear amplifier).  No fine tuning is required: the
+receiver searches ±150 Hz on acquisition and then tracks drift.  Pilot
+blocks come every 0.86 s, the channel is interpolated between them and
+re-estimated decision-directed inside every block, and a piecewise
+time-varying equaliser follows fading within a block.  Use `--long-code`
+(time diversity across the superframe) and the QPSK modes on real HF
+paths; voice at 1200 bit/s fits with `qpsk-3/4` and leaves ~0.5 kbit/s
+for video, so most HF users will run `--audio-rate 0` for video or the
+analog video mode for voice-free pictures.  Measured through a Watterson
+two-path simulator (12 s, mistuned 73 Hz, 60 ppm clock offset, long code):
+
+| condition (CCIR) | qpsk-1/2 | qpsk-3/4 | 16qam-3/4 |
+|---|---|---|---|
+| good (0.5 ms, 0.1 Hz), 6 / 9 / 12 / 18 dB | 10/11, 11/11, 11/11, 11/11 | 10/11, 11/11, 11/11, 11/11 | 0, 0, 8/11, 11/11 |
+| moderate (1 ms, 0.5 Hz), 9 / 12 / 18 dB | 8/11, 8/11, 9/11 | 7/11, 7/11, 8/11 | unusable |
+| poor (2 ms, 1 Hz), 12 / 18 dB | 6/11, 6/11 | 5/11, 6/11 | unusable |
+
+(superframes decoded / sent).  Poor conditions are limited by the 190 ms
+block length; shorter blocks or interleaving across superframes would be
+the next step.
+
+**AM.**  The carrier cancels in the detector, so no frequency search is
+needed and the voice-channel machinery applies.  What matters is
+*modulation depth*: the modulator must never reach 100 % on negative peaks,
+so set the audio drive for about 90 % peak modulation (`--level 0.3` gives
+3× RMS peaks, i.e. ~30 % average modulation).  On a stable path the AM
+profile runs 16-QAM 3/4 at 20 dB SNR (12/12 superframes in the model).  On
+a selectively fading path an **envelope detector** distorts whenever the
+carrier fades below the sidebands (4/12 superframes in "good" fading);
+a **synchronous detector** (`--am-sync` in the simulator; sync-AM / SDR
+receivers in practice) recovers most of it (10/12).  Use QPSK modes on
+fading AM paths.
+
 ### Long codes: `--long-code`
 
 One LDPC codeword spans all seven payload blocks of a superframe instead of
@@ -197,7 +240,7 @@ hamdv/videocodec.py   digital video codec (integer DCT, motion, RDO, arithmetic 
 hamdv/softvideo.py    analog video transport (3-D DCT, power allocation, Hadamard, LLSE)
 hamdv/vocoder.py      LPC/LSP mixed-excitation speech codec
 hamdv/rangecoder.py   adaptive binary range coder
-hamdv/channel.py      FM repeater channel simulator
+hamdv/channel.py      channel simulators: FM repeater, flat 9600-port, HF SSB (Watterson), HF AM
 hamdv/tx.py, rx.py    transmitter / receiver pipelines
 hamdv/audioio.py      sound devices, resampling, PTT;  camera.py  video sources;  viewer.py  HTTP viewer
 hamdv/cli.py          command line

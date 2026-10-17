@@ -40,6 +40,8 @@ def add_media_args(ap: argparse.ArgumentParser):
     ap.add_argument("--baud", type=int, default=1600, choices=[1600, 2000, 4000],
                     help="1600/2000: voice channel (mic/speaker path, repeater); 4000: flat 9600-baud data port (16 kHz audio)")
     ap.add_argument("--long-code", action="store_true", help="one LDPC codeword per superframe (~1 dB gain, all-or-nothing)")
+    ap.add_argument("--profile", default=None, choices=sorted(PROFILES),
+                    help="waveform profile (overrides --baud): voice, voice2k, flat, ssb (HF single sideband), am (HF AM)")
 
 
 def make_tx(args) -> Transmitter:
@@ -47,7 +49,7 @@ def make_tx(args) -> Transmitter:
     cfg = TxConfig(callsign=args.callsign, width=w, height=h, frames_per_sf=args.frames_per_sf,
                    audio_mode=args.audio_rate, dig_mode=args.mode, analog=args.analog,
                    analog_blocks=args.analog_blocks, refresh=args.refresh, level=args.level, text=args.text,
-                   baud=args.baud, long_code=args.long_code)
+                   baud=args.baud, long_code=args.long_code, profile=args.profile)
     return Transmitter(cfg)
 
 
@@ -176,15 +178,21 @@ def cmd_sim(args):
     audio_src = load_audio_source(args.audio, args.seconds)
     sent = []
     flat = args.flat or args.baud == 4000
-    print(f"HamDV simulation: {args.baud} Bd{' long code' if args.long_code else ''}, {args.mode}, {w}x{h}, "
-          f"{'analog' if args.analog else 'digital'} video, audio {args.audio_rate} bps, "
-          f"{'flat 9600-port' if flat else 'voice repeater'} channel, SNR {args.snr} dB, drift {args.sro} ppm")
+    hf = tx.p.name if tx.p.name in ("ssb", "am") else ""
+    chan_name = {"ssb": f"HF SSB ({args.hf_condition}, mistuned {args.cfo:+.0f} Hz)",
+                 "am": f"HF AM ({args.hf_condition}, {'sync' if args.am_sync else 'envelope'} detector)"}.get(
+        hf, 'flat 9600-port' if flat else 'voice repeater')
+    print(f"HamDV simulation: profile {tx.p.name} {tx.p.baud:.0f} Bd{' long code' if args.long_code else ''}, "
+          f"{args.mode}, {w}x{h}, {'analog' if args.analog else 'digital'} video, audio {args.audio_rate} bps, "
+          f"{chan_name} channel, SNR {args.snr} dB, drift {args.sro} ppm")
     t0 = time.time()
     tx_audio = generate_transmission(tx, video, audio_src, args.seconds, sent)
     t_enc = time.time() - t0
     rx_audio = simulate(tx_audio, ChannelConfig(fs=tx.p.fs, flat=flat, snr_db=args.snr, sro_ppm=args.sro,
                                                 limiter_drive=args.limiter, id_tone=args.id_tone,
-                                                impulse_rate=args.impulses, seed=args.seed))
+                                                impulse_rate=args.impulses, seed=args.seed,
+                                                hf=hf, hf_condition=args.hf_condition, cfo_hz=args.cfo,
+                                                am_sync=args.am_sync))
     sink = FrameSink(args.out_dir)
     audio_out = []
     rx = Receiver(verbose=args.verbose, on_frame=sink, on_audio=audio_out.append,
@@ -408,6 +416,10 @@ def main(argv=None):
     s.add_argument("--impulses", type=float, default=0.0, help="impulse noise events per second")
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--flat", action="store_true", help="model the flat 9600-port path instead of the voice repeater")
+    s.add_argument("--hf-condition", default="good", choices=["none", "good", "moderate", "poor", "flutter"],
+                   help="HF ionospheric condition (Watterson two-path model) for the ssb/am profiles")
+    s.add_argument("--cfo", type=float, default=0.0, help="SSB receiver mistuning in Hz")
+    s.add_argument("--am-sync", action="store_true", help="AM: synchronous detector instead of envelope detector")
     s.add_argument("--out-dir", default=None, help="write received frames, contact sheet, mp4 and wav files here")
     s.add_argument("--verbose", action="store_true")
     s.set_defaults(func=cmd_sim)

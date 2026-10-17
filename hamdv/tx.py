@@ -35,13 +35,14 @@ class TxConfig:
     keyup_s: float = 0.4              # silence after PTT before the preamble (repeater key-up)
     baud: int = 1600                  # 1600 / 2000 (voice channel) or 4000 (flat 9600-baud data port)
     long_code: bool = False           # one LDPC codeword over all digital payload blocks (~1 dB gain)
+    profile: Optional[str] = None     # explicit waveform profile name (voice, voice2k, flat, ssb, am); overrides baud
 
 
 class Transmitter:
     def __init__(self, cfg: TxConfig, p: Optional[ModemParams] = None):
         self.cfg = cfg
         if p is None:
-            p = PROFILES[BAUD_PROFILE[cfg.baud]]
+            p = PROFILES[cfg.profile] if cfg.profile else PROFILES[BAUD_PROFILE[cfg.baud]]
         self.p = p
         if cfg.width % 8 or cfg.height % 8:
             raise ValueError("video size must be a multiple of 8")

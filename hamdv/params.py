@@ -29,6 +29,10 @@ class ModemParams:
     preamble_root: int = 7
     pilot_root: int = 29         # ZC root for the 256-symbol pilot block (odd => coprime with 256)
     tail_sym: int = 24           # idle symbols after the last superframe
+    # HF-specific behaviour
+    cfo_search_hz: float = 0.0   # acquisition searches carrier offsets in +- this range (SSB)
+    interp_channel: bool = False # equalise with the channel interpolated between consecutive pilot blocks (fading)
+    track_gain: bool = False     # per-block amplitude correction from the scattered pilots (fading)
 
     @property
     def baud(self) -> float:
@@ -90,5 +94,15 @@ PROFILES = {
     "voice2k": ModemParams(name="voice2k", fs=8000, sps=4, fc=1700.0, alpha=0.25),   # 2000 Bd, 450-2950 Hz
     "flat":    ModemParams(name="flat", fs=16000, sps=4, fc=3000.0, alpha=0.25),     # 4000 Bd, 500-5500 Hz
 }
+# HF profiles.  SSB: fits a 2.4 kHz filter (633-2367 Hz), tolerates +-150 Hz mistuning and
+# ionospheric fading (pilot every ~1 s, channel interpolation, gain tracking).  AM: for
+# envelope-detected AM, 2000 Bd in 500-3100 Hz; the carrier cancels in the detector so
+# no frequency search is needed, but modulation depth must stay below 100 % (see README).
+# HF profiles use a 32-symbol cyclic prefix: ionospheric delay spread plus the long impulse
+# response of sharp SSB filters (large group delay at the band edges) exceed 16 symbols.
+PROFILES["ssb"] = ModemParams(name="ssb", fs=8000, sps=6, fc=1500.0, alpha=0.3, blocks_per_sf=4, cp=32, win_lead=8,
+                              cfo_search_hz=150.0, interp_channel=True, track_gain=True)
+PROFILES["am"] = ModemParams(name="am", fs=8000, sps=4, fc=1800.0, alpha=0.3, blocks_per_sf=4, cp=32, win_lead=8,
+                             interp_channel=True, track_gain=True)
 BAUD_PROFILE = {1600: "voice", 2000: "voice2k", 4000: "flat"}
 DEFAULT = PROFILES["voice"]

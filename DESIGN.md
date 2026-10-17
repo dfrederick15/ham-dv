@@ -55,6 +55,8 @@ and follows the one that locks):
 | voice | 8 kHz | 5 | 1600 Bd | 1700 Hz | 0.35 | 620–2780 Hz |
 | voice2k | 8 kHz | 4 | 2000 Bd | 1700 Hz | 0.25 | 450–2950 Hz |
 | flat (9600-baud data port) | 16 kHz | 4 | 4000 Bd | 3000 Hz | 0.25 | 500–5500 Hz |
+| ssb (HF) | 8 kHz | 6 | 1333 Bd | 1500 Hz | 0.3 | 633–2367 Hz, CP 32, 4 blocks/superframe |
+| am (HF) | 8 kHz | 4 | 2000 Bd | 1800 Hz | 0.3 | 500–3100 Hz, CP 32, 4 blocks/superframe |
 
 The flat profile assumes the radio's unfiltered modulator-in /
 discriminator-out path (no pre-emphasis, no limiter, no voice-band
@@ -151,6 +153,71 @@ $\phi_0 = \arg \sum_i \hat x_{p_i} p_i^*$ and the phase slope
 $\omega = \arg\sum_i (\hat x_{p_{i+1}} p_{i+1}^*)(\hat x_{p_i} p_i^*)^*/32$
 of each block, and their error power is a per-block sanity check on $\sigma^2_{eq}$
 (bursts such as a CW ID raise it, which de-weights that block in the decoders).
+
+## 3.5 HF profiles: carrier offset, drift and fading
+
+**Acquisition with a frequency-hypothesis bank.**  On SSB the carrier
+offset can reach ±150 Hz, far beyond what the two-repetition phase
+estimator resolves (±baud/2L ≈ ±5 Hz).  The preamble correlation is
+therefore computed in segments of 4 symbols, and the partial sums are
+combined with a 64-point DFT across the segment index,
+
+$$C_f[t] = \sum_m c_m[t]\, e^{-j2\pi f \cdot 4T m},\qquad f = \frac{k}{64\cdot 4T},$$
+
+which evaluates every offset hypothesis at once (spacing 5.2 Hz, range
+±167 Hz, within-segment loss < 1.3 dB at 150 Hz).  The residual is then
+measured from the phase between the two preamble halves after removing the
+phase the hypothesis accumulates over one half.
+
+**Opposite-slope chirps.**  A single Zadoff–Chu sequence is a chirp whose
+delay–Doppler ambiguity is a ridge: an offset of $u$ bins looks exactly like
+a one-symbol time shift.  The preamble therefore uses roots $u$ and $N-u$
+(opposite slopes); the ridges cross only at the true $(\tau, f)$, and the
+metric requires both halves to peak together.  This also removes a subtle
+failure mode on FM where sound-card offsets are tiny but non-zero.
+
+**Frequency-locked loop.**  The phase slope across each block's scattered
+pilots, gated on their fit error, drives $\hat f \leftarrow \hat f + 0.1\,\omega\,\text{baud}/2\pi$
+(clipped to 0.2 Hz per block) to follow drift.
+
+**Fading.**  HF profiles use 4 data blocks per superframe (pilot every
+0.86 s), a 32-symbol cyclic prefix (delay spread plus the long impulse
+response of sharp SSB filters) and three mechanisms on top of the static
+equaliser:
+
+1. *Interpolation between pilot blocks.*  The next superframe's pilot is
+   located before the current one is equalised; its channel estimate is
+   taken at the clock-predicted position, never at the measured
+   correlation peak, because on a multipath channel the peak hops between
+   paths by more than a symbol and the two estimates would differ by a
+   linear phase.  The timing anchor itself follows the clock and is nudged
+   by at most 0.3 symbol per superframe; the drift loop is slow and
+   clipped.  (Getting this reference right was worth 5 superframes out of
+   11 in moderate conditions.)
+2. *Decision-directed re-estimation.*  Each block is equalised, decided
+   against the constellation the header announced for it, and the channel
+   re-estimated by Bayesian least squares with the interpolated channel as
+   prior,
+   $\hat H_{dd}[k] = \dfrac{Y[k]X^*[k] + \lambda H_{prior}[k]}{|X[k]|^2 + \lambda}$,
+   projected onto the cyclic-prefix subspace.  (A plain regularised
+   division biases towards zero and costs 20 dB.)
+3. *Piecewise time-varying equalisation.*  With per-block estimates as
+   knots, the channel is treated as piecewise linear in time; every block
+   is equalised four times with the channel at each quarter and the
+   matching quarter of each output is kept.
+
+Per-block amplitude is corrected from the scattered pilots (damped).  The
+block length (190 ms) sets the limit: CCIR good and moderate conditions
+work with QPSK, poor (1 Hz Doppler) decodes about half the superframes.
+
+**AM.**  With envelope detection the received audio is
+$|{\textstyle\sum_i} g_i(t)\,(1 + m\,x(t-\tau_i))| - \text{mean}$: linear in $x$
+while the carrier term dominates, nonlinear when the paths cancel the
+carrier (selective-fading distortion).  The carrier cancels in the detector,
+so there is no frequency offset to search; the modulation index $m$ must
+keep $1 + m x(t) > 0$, i.e. peaks below 100 %.  A synchronous detector
+$\Re\{r(t)e^{-j\arg \hat c(t)}\}$ keeps the channel linear through carrier
+fades, which the simulator confirms (10/12 vs 4/12 superframes).
 
 ## 4. Forward error correction
 
@@ -435,8 +502,9 @@ Lost frames are concealed by fading the previous parameters.
 ## 10. Interoperability checklist
 
 * Sample rate 8000, symbol rate 1600, carrier 1700, RRC α 0.35 span 10.
-* Preamble ZC(127, u=7) ×2; pilot ZC(256, u=29); scattered pilots: the first
-  8 elements of ZC(9, u=1) normalised, at body positions 16+32i.
+* Preamble ZC(127, u=7) followed by ZC(127, u=120); pilot ZC(256, u=29);
+  scattered pilots: the first 8 elements of ZC(9, u=1) normalised, at body
+  positions 16+32i.
 * Blocks: CP 16 + body 256; 8 data blocks per superframe; tail 24 zeros.
 * LDPC: p = 31, column weight 3, seeds 1234 + 1000·bc + br (see `ldpc.py`),
   interleaver = NumPy default_rng(0xC0DE + n).permutation(n).

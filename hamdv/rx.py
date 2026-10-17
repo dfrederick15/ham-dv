@@ -10,8 +10,11 @@ import numpy as np
 from .framing import (Header, PKT_AUDIO, PKT_VIDEO, PKT_VMETA, PKT_TEXT, PKT_INFO, AUDIO_MODES,
                       decode_superframe, DecodedSuperframe)
 from .modem import Demodulator, EqualisedBlock
-from .params import ModemParams, DEFAULT, DIGITAL_MODES, PROFILES
+from .params import ModemParams, DEFAULT, DIGITAL_MODES, PROFILES, PAS_RATES
 from .audioio import StreamResampler
+from .constellation import constellation
+from .shaping import pas_mode
+from .framing import plan
 from .softvideo import SoftDecoder, SoftConfig, unpack_meta
 from .videocodec import VideoDecoder
 from .interp import dense_field
@@ -41,8 +44,9 @@ class Receiver:
                  on_text: Optional[Callable[[str, str], None]] = None,
                  profiles: Optional[List[str]] = None, fs_in: int = 8000):
         if p is not None:
-            profiles = [p.name]
-        self.profiles = {name: PROFILES[name] for name in (profiles or list(PROFILES))}
+            self.profiles = {p.name: p}
+        else:
+            self.profiles = {name: PROFILES[name] for name in (profiles or list(PROFILES))}
         self.verbose = verbose
         self.fs_in = fs_in
         self.dems: Dict[str, Demodulator] = {n: Demodulator(pp, verbose=verbose) for n, pp in self.profiles.items()}
@@ -74,23 +78,32 @@ class Receiver:
             self.fs_in = fs_in
             self.resamplers = {n: StreamResampler(fs_in, pp.fs) for n, pp in self.profiles.items()}
         samples = np.asarray(samples, dtype=np.float64)
-        targets = [self.active] if self.active else list(self.profiles)
-        for name in targets:
+        # every profile's demodulator runs all the time; the receiver follows the locked one
+        # with the best pilot correlation (a wrong profile can false-lock on a preamble for
+        # one superframe, then loses its pilot)
+        for name in self.profiles:
             x = samples if self.profiles[name].fs == self.fs_in else self.resamplers[name].process(samples)
             self.dems[name].feed(x)
-            for e in self.dems[name].events[self.n_events_by[name]:]:
-                self.n_events_by[name] += 1
-                if e.startswith("ACQ") and self.active is None:
-                    self.active = name
-                    self.p = self.profiles[name]
-                    self.dem = self.dems[name]
-                    self.status["state"] = "locked"
-                    self.status["profile"] = name
-                    self.status["baud"] = int(round(self.p.baud))
-                elif e.startswith("LOST") and self.active == name:
-                    self.active = None
-                    self.pending.clear()
-                    self.status["state"] = "searching"
+            self.n_events_by[name] = len(self.dems[name].events)
+
+        def quality(n):
+            d = self.dems[n]
+            return d.sf_info[-1].corr_quality if d.sf_info else 0.0
+        locked = [n for n in self.profiles if self.dems[n].state == Demodulator.LOCKED]
+        if self.active is not None and self.dems[self.active].state != Demodulator.LOCKED:
+            self.active = None
+            self.pending.clear()
+            self.status["state"] = "searching"
+        if self.active is None and locked:
+            self.active = max(locked, key=quality)
+            self.p = self.profiles[self.active]
+            self.dem = self.dems[self.active]
+            self.status["state"] = "locked"
+            self.status["profile"] = self.active
+            self.status["baud"] = int(round(self.p.baud))
+        for name in self.profiles:
+            if name != self.active:
+                self.dems[name].blocks.clear()
         if self.active is None:
             return
         self.dem = self.dems[self.active]
@@ -132,6 +145,13 @@ class Receiver:
         st["last_rx"] = time.time()
         if hdr.is_last:
             self.dem.end_of_transmission()
+        # tell the demodulator which constellation each block carries (decision-directed tracking)
+        pl = plan(hdr, self.p)
+        pts = pas_mode(PAS_RATES[hdr.dig_mode]).points if hdr.dig_mode in PAS_RATES else constellation(DIGITAL_MODES[hdr.dig_mode][1])[0]
+        hints = {0: constellation(2)[0]}
+        for b in pl.digital_blocks:
+            hints[b] = pts
+        self.dem.block_points = hints
         new_stream = (self.last_header is None or hdr.tx_id != self.last_header.tx_id
                       or (hdr.vid_w, hdr.vid_h, hdr.analog_video, hdr.frames_per_sf) !=
                       (self.last_header.vid_w, self.last_header.vid_h, self.last_header.analog_video, self.last_header.frames_per_sf))
