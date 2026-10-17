@@ -308,6 +308,27 @@ its budget by more than 25 %.
 **Display post-filter.**  A deblocking filter smooths block edges whose
 discontinuity is smaller than a quantiser step, outside the prediction loop.
 
+### 6.1 Motion-interpolated display
+
+The channel carries 2–4 real frames per second; the viewer renders 30.  Let
+$F_0$ and $F_1$ be consecutive decoded frames and $v(p)$ the displacement
+field with $F_1(p) \approx F_0(p + v(p))$.  For the digital codec $v$ is the
+decoded macroblock motion field, bilinearly upsampled to pixel resolution
+(INTRA blocks borrow the median of their neighbours); for the analog
+transport a global translation is estimated with the Lucas–Kanade
+least-squares solver of §6.  The frame at fraction $t$ of the interval is the
+bidirectional motion-compensated blend
+
+$$F_t(p) = (1-t)\,F_0\big(p + t\,v(p)\big) + t\,F_1\big(p - (1-t)\,v(p)\big),$$
+
+evaluated with bilinear sampling.  Real frames arrive in bursts of one
+superframe, so the viewer runs a playout clock delayed by about one
+superframe (1.7 s): every real frame is scheduled at its nominal media time
+and the render thread always has the bracketing pair available.  On a
+translated test scene the interpolated midpoint is more than 6 dB closer to
+the true intermediate frame than a cross-fade.  Nothing is transmitted for
+this; it costs the receiver a few milliseconds per displayed frame.
+
 ## 7. Analog video transport
 
 Let $V$ be the YCbCr GOP volume ($T\times H\times W$ per plane, $T$ = frames

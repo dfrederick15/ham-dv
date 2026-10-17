@@ -89,12 +89,14 @@ class FrameSink:
         self.frames: List[np.ndarray] = []
         self.infos: List[FrameInfo] = []
         self.upscale = upscale
+        self.fps = 2.0
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
     def __call__(self, rgb: np.ndarray, info: FrameInfo):
         self.frames.append(rgb)
         self.infos.append(info)
+        self.fps = info.fps
         if self.out_dir:
             from PIL import Image
             im = Image.fromarray(rgb).resize((rgb.shape[1] * self.upscale, rgb.shape[0] * self.upscale), Image.BILINEAR)
@@ -126,12 +128,22 @@ class FrameSink:
                 sbs.paste(Image.fromarray(originals[i]).resize((w * 2, h * 2), Image.BILINEAR), (0, j * h * 2))
                 sbs.paste(Image.fromarray(self.frames[i]).resize((w * 2, h * 2), Image.BILINEAR), (w * 2, j * h * 2))
             sbs.save(os.path.join(self.out_dir, "original_vs_received.png"))
+        # motion-interpolated 30 fps sequence (what the live viewer shows)
+        from .interp import smooth_sequence
+        smooth = smooth_sequence(self.frames, [i.field for i in self.infos], fps, 30.0)
+        sdir = os.path.join(self.out_dir, "smooth30")
+        os.makedirs(sdir, exist_ok=True)
+        for k, f in enumerate(smooth):
+            Image.fromarray(f).resize((w * self.upscale, h * self.upscale), Image.BILINEAR).save(os.path.join(sdir, f"f_{k:05d}.png"))
         # mp4 via ffmpeg if available
         try:
             import subprocess
             subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", f"{fps:.3f}", "-i",
                             os.path.join(self.out_dir, "rx_%05d.png"), "-pix_fmt", "yuv420p",
                             os.path.join(self.out_dir, "received.mp4")], check=False, timeout=120)
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", "30", "-i",
+                            os.path.join(sdir, "f_%05d.png"), "-pix_fmt", "yuv420p",
+                            os.path.join(self.out_dir, "received_smooth30.mp4")], check=False, timeout=300)
         except Exception:
             pass
 
@@ -175,6 +187,7 @@ def cmd_sim(args):
     t_dec = time.time() - t0
     fps = tx.cfg.frames_per_sf / tx.sf_seconds
     sink.finish(fps, sent)
+    sink_fps = fps
     pl_bits = tx.stats["video_bits"] + tx.stats["audio_bits"]
     print(f"TX: {len(tx_audio)/8000:.1f} s of audio, {tx.stats['sf']} superframes, video {tx.stats['video_bits']/(tx.stats['sf']*tx.sf_seconds):.0f} bps, "
           f"audio {tx.stats['audio_bits']/(tx.stats['sf']*tx.sf_seconds):.0f} bps, PAPR {20*np.log10(np.abs(tx_audio).max()/np.sqrt(np.mean(tx_audio**2))):.1f} dB "
@@ -193,7 +206,8 @@ def cmd_sim(args):
         ww = WavWriter(os.path.join(args.out_dir, "rx_audio.wav"))
         ww.write(rx_audio / max(1.0, np.abs(rx_audio).max()))
         ww.close()
-        print(f"  outputs written to {args.out_dir}/ (rx_*.png, contact_sheet.png, original_vs_received.png, received.mp4, *.wav)")
+        print(f"  outputs written to {args.out_dir}/ (rx_*.png, contact_sheet.png, original_vs_received.png, received.mp4, "
+              f"received_smooth30.mp4 = motion-interpolated 30 fps as shown by the viewer, *.wav)")
 
 
 def cmd_encode(args):
@@ -219,7 +233,7 @@ def cmd_decode(args):
     for i in range(0, len(rx_audio), 4000):
         rx.feed(rx_audio[i:i + 4000])
     rx.feed(np.zeros(16000))
-    sink.finish(2.0)
+    sink.finish(sink.fps)
     report(rx, sink)
     if args.out_dir and audio_out:
         ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"))
@@ -314,13 +328,13 @@ def cmd_tx(args):
 def cmd_rx(args):
     from .audioio import AudioInput, AudioOutput, read_wav
     from .viewer import Viewer
-    viewer = Viewer(args.http) if args.http else None
+    viewer = Viewer(args.http, smooth_fps=args.smooth_fps) if args.http else None
     spk = AudioOutput(device=args.out_device, fs_dev=args.device_rate) if args.out_device is not None or not args.no_speaker else None
     sink = FrameSink(args.save_dir) if args.save_dir else None
 
     def on_frame(rgb, info):
         if viewer:
-            viewer.update_frame(rgb)
+            viewer.push_frame(rgb, info.fps, info.field)
         if sink:
             sink(rgb, info)
         if args.window:
@@ -363,7 +377,7 @@ def cmd_rx(args):
             mic.close()
     report(rx, sink or FrameSink(None))
     if sink:
-        sink.finish(2.0)
+        sink.finish(sink.fps)
     if spk is not None:
         spk.close()
 
@@ -422,6 +436,7 @@ def main(argv=None):
     r.add_argument("--http", type=int, default=8080, help="viewer port (0 = off)")
     r.add_argument("--window", action="store_true", help="also show an OpenCV window")
     r.add_argument("--save-dir", default=None)
+    r.add_argument("--smooth-fps", type=float, default=30.0, help="viewer display rate with motion interpolation (0 = show real frames only)")
     r.add_argument("--volume", type=float, default=1.0)
     r.add_argument("--verbose", action="store_true")
     r.set_defaults(func=cmd_rx)

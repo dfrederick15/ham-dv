@@ -590,6 +590,8 @@ class VideoDecoder:
         self.last_frame_num: Optional[int] = None
         self.frames_decoded = 0
         self.frames_lost = 0
+        self.last_mvs: Optional[np.ndarray] = None      # (n_mb, 2) [dx, dy] of the last decoded frame
+        self.last_modes: Optional[np.ndarray] = None    # 0 skip, 1 inter, 2 intra
 
     def decode_frame(self, payload: bytes) -> Optional[np.ndarray]:
         """Decode a frame payload; returns RGB uint8 (h, w, 3) or None on error."""
@@ -661,6 +663,7 @@ class VideoDecoder:
             return None
         st.y, st.cb, st.cr = rec_y, rec_cb, rec_cr
         self.frames_decoded += 1
+        self.last_mvs, self.last_modes = mvs, modes
         if self.postfilter:
             thr = 1.5 * step8 / 8.0 / 8.0 * 2 + 2     # ~ pixel-domain size of one quantiser step on the DC
             return ycbcr420_to_rgb(deblock(rec_y, 8, thr), deblock(rec_cb, 4, thr), deblock(rec_cr, 4, thr))

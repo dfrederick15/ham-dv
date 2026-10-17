@@ -62,7 +62,11 @@ hamdv rx --in-device 1 --out-device 2 --http 8080
 ```
 
 Any computer on the LAN can open the viewer page; the page shows the
-transmitting station's callsign, SNR, mode and the live picture.  Several
+transmitting station's callsign, SNR, mode and the live picture.  The
+viewer displays **30 frames per second**: the 2–4 real frames per second
+that the channel carries are motion-interpolated for display using the
+motion vectors the codec already transmits (no extra bits on the air, see
+DESIGN.md §6.1).  `--smooth-fps 0` shows only the real frames.  Several
 stations on a repeater simply take turns transmitting ("video round table"):
 the receivers follow whoever is keyed.
 

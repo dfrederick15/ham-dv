@@ -13,6 +13,7 @@ from .modem import Demodulator, EqualisedBlock
 from .params import ModemParams, DEFAULT, DIGITAL_MODES
 from .softvideo import SoftDecoder, SoftConfig, unpack_meta
 from .videocodec import VideoDecoder
+from .interp import dense_field
 from .vocoder import VocoderDecoder, unpack_frames, bits_per_frame, FRAME as AFRAME
 
 
@@ -25,6 +26,8 @@ class FrameInfo:
     width: int
     height: int
     frame_index: int
+    fps: float = 2.0                      # nominal frame rate announced by the transmitter
+    field: Optional[np.ndarray] = None    # dense (2, h, w) motion field relative to the previous frame
 
 
 class Receiver:
@@ -135,7 +138,9 @@ class Receiver:
             elif t == PKT_VIDEO and self.vdec is not None:
                 rgb = self.vdec.decode_frame(payload)
                 if rgb is not None:
-                    self._emit(rgb, hdr, d.snr_db, False)
+                    st_ = self.vdec.st
+                    field = dense_field(self.vdec.last_mvs, self.vdec.last_modes, st_.mbw, st_.mbh, st_.h, st_.w)
+                    self._emit(rgb, hdr, d.snr_db, False, field)
             elif t == PKT_VMETA and self.sdec is not None:
                 meta = unpack_meta(payload, self.sdec.cfg)
                 if meta is not None and len(d.analog_values):
@@ -157,8 +162,9 @@ class Receiver:
         if self.on_audio is not None:
             self.on_audio(out)
 
-    def _emit(self, rgb: np.ndarray, hdr: Header, snr: float, analog: bool):
+    def _emit(self, rgb: np.ndarray, hdr: Header, snr: float, analog: bool, field: Optional[np.ndarray] = None):
         self.frame_index += 1
         self.status["frames"] += 1
         if self.on_frame is not None:
-            self.on_frame(rgb, FrameInfo(hdr.callsign, hdr.sf_seq, snr, analog, hdr.vid_w, hdr.vid_h, self.frame_index))
+            self.on_frame(rgb, FrameInfo(hdr.callsign, hdr.sf_seq, snr, analog, hdr.vid_w, hdr.vid_h,
+                                         self.frame_index, max(hdr.vid_fps_x10, 1) / 10.0, field))
