@@ -378,7 +378,7 @@ class Demodulator:
             self.misses += 1
             if self.verbose:
                 print(f"SF {self.sf_index}: pilot miss ({best_q:.2f})")
-            if self.misses >= 3 or self.sf_index == 0:
+            if self.misses >= (6 if p.interp_channel else 3) or self.sf_index == 0:
                 self._lose("pilot lost")
                 return True
             self.next_anchor += p.sf_len * sps * (1.0 + self.sro)

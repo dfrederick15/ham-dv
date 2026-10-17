@@ -37,7 +37,11 @@ PKT_PAD, PKT_HEADER, PKT_AUDIO, PKT_VIDEO, PKT_VMETA, PKT_TEXT, PKT_INFO = 0, 1,
 FLAG_LAST = 1
 FLAG_ANALOG_VIDEO = 2
 FLAG_LONGCODE = 4          # one LDPC codeword spans all digital payload blocks of the superframe
-AUDIO_MODES = {0: 0, 1: 1200, 2: 1600, 3: 2400}
+FLAG_IL_SHIFT = 3          # bits 3-4: interleaving depth code (0..3 -> 1, 2, 4, 8 superframes)
+IL_DEPTHS = (1, 2, 4, 8)
+AUDIO_MODES = {0: 0, 1: 1200, 2: 1600, 3: 2400,            # built-in LPC vocoder (8 kHz)
+               4: 6000, 5: 8000, 6: 12000, 7: 16000}       # Opus wideband (16 kHz), DV modes
+OPUS_MODES = {6000, 8000, 12000, 16000}
 ANALOG_BACKOFF = 0.75      # analog symbols are Gaussian: back them off 2.5 dB so the radio's limiter stays out
 AUDIO_MODE_IDX = {v: k for k, v in AUDIO_MODES.items()}
 
@@ -132,6 +136,11 @@ class Header:
     @property
     def long_code(self) -> bool:
         return bool(self.flags & FLAG_LONGCODE)
+
+    @property
+    def interleave(self) -> int:
+        """Interleaving depth in superframes (1 = none)."""
+        return IL_DEPTHS[(self.flags >> FLAG_IL_SHIFT) & 3]
 
     def n_analog_blocks(self, p: ModemParams) -> int:
         return sum(1 for b in range(1, p.blocks_per_sf) if (self.block_types >> b) & 1)
@@ -289,7 +298,7 @@ def plan(header: Header, p: ModemParams = DEFAULT) -> SuperframePlan:
 
 
 def build_superframe(header: Header, packets: List[bytes], analog_values: np.ndarray,
-                     p: ModemParams = DEFAULT) -> np.ndarray:
+                     p: ModemParams = DEFAULT, interleaver: Optional[SymbolInterleaver] = None) -> np.ndarray:
     """Return the superframe's symbols (pilot block + B data blocks)."""
     pl = plan(header, p)
     area0 = pack_packet(PKT_HEADER, header.pack())
@@ -307,12 +316,91 @@ def build_superframe(header: Header, packets: List[bytes], analog_values: np.nda
         for b, s in zip(g, encode_digital_group(area[pos:pos + cap], header.dig_mode, len(g), p)):
             syms[b] = s
         pos += cap
+    if interleaver is not None and pl.digital_blocks:
+        flat = np.concatenate([syms[b] for b in pl.digital_blocks])
+        tx = interleaver.push(flat)
+        n = p.data_sym_per_block
+        for i, b in enumerate(pl.digital_blocks):
+            syms[b] = tx[i * n:(i + 1) * n]
     nv = 2 * p.data_sym_per_block
     for i, b in enumerate(pl.analog_blocks):
         syms[b] = encode_analog_block(analog_values[i * nv:(i + 1) * nv], p)
     for b in range(p.blocks_per_sf):
         blocks.append(build_data_block(p, syms[b]))
     return np.concatenate(blocks)
+
+
+# ------------------------------------------------------------------ cross-superframe interleaving
+class SymbolInterleaver:
+    """Diagonal (convolutional) interleaver over the digital payload symbols of D superframes.
+
+    With S_k the coded symbols of superframe k (flattened over its digital blocks),
+    the symbols actually transmitted in superframe k are
+        T_k[j] = S_{k - (j mod D)}[j],
+    so every codeword is spread evenly over D consecutive superframes and adjacent
+    symbols never share a superframe.  Fades and impulse bursts then erase a
+    fraction 1/D of a codeword instead of all of it (time diversity).  Latency is
+    D-1 superframes; the transmitter flushes D-1 superframes at the end.
+    """
+
+    def __init__(self, depth: int, n_sym: int):
+        self.D = depth
+        self.n = n_sym
+        self.hist: List[np.ndarray] = [np.zeros(n_sym, dtype=np.complex128) for _ in range(depth)]
+        self.j = np.arange(n_sym)
+
+    def push(self, s: np.ndarray) -> np.ndarray:
+        """s: this superframe's coded symbols (n_sym). Returns the symbols to transmit now."""
+        self.hist.append(np.asarray(s, dtype=np.complex128))
+        self.hist = self.hist[-self.D:]
+        if self.D == 1:
+            return self.hist[-1]
+        # hist[-1] is S_k, hist[-1-d] is S_{k-d}
+        out = np.empty(self.n, dtype=np.complex128)
+        for d in range(self.D):
+            m = (self.j % self.D) == d
+            out[m] = self.hist[-1 - d][m]
+        return out
+
+
+class SymbolDeinterleaver:
+    """Inverse of SymbolInterleaver: codeword m is complete once superframes m..m+D-1 arrived."""
+
+    def __init__(self, depth: int, n_sym: int):
+        self.D = depth
+        self.n = n_sym
+        self.j = np.arange(n_sym)
+        self.rx: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}   # sf index -> (symbols, noise var per symbol)
+
+    def push(self, k: int, symbols: np.ndarray, noise: np.ndarray) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+        """Add received superframe k; returns the list of (m, symbols, noise) codewords now complete."""
+        self.rx[k] = (symbols, noise)
+        done = []
+        for m in sorted(self.rx):
+            if m > k - (self.D - 1):
+                break
+            if all((m + d) in self.rx for d in range(self.D)):
+                s = np.empty(self.n, dtype=np.complex128)
+                nv = np.empty(self.n)
+                for d in range(self.D):
+                    msk = (self.j % self.D) == d
+                    s[msk] = self.rx[m + d][0][msk]
+                    nv[msk] = self.rx[m + d][1][msk]
+                done.append((m, s, nv))
+            else:
+                # a superframe in the window is missing: erase those symbols (infinite noise)
+                s = np.zeros(self.n, dtype=np.complex128)
+                nv = np.full(self.n, 1e6)
+                for d in range(self.D):
+                    if (m + d) in self.rx:
+                        msk = (self.j % self.D) == d
+                        s[msk] = self.rx[m + d][0][msk]
+                        nv[msk] = self.rx[m + d][1][msk]
+                done.append((m, s, nv))
+            del self.rx[m]
+        for old in [i for i in self.rx if i < k - 2 * self.D]:
+            del self.rx[old]
+        return done
 
 
 @dataclass
@@ -326,25 +414,24 @@ class DecodedSuperframe:
     snr_db: float
 
 
-def decode_superframe(blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
-                      last_header: Optional[Header] = None) -> Optional[DecodedSuperframe]:
-    """blocks: the B equalised data blocks of one superframe (block index order)."""
-    if len(blocks) != p.blocks_per_sf:
-        return None
+def decode_header(blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
+                  last_header: Optional[Header] = None) -> Tuple[Optional[Header], bool]:
     area0, ok0 = decode_digital_block(blocks[0], HEADER_MODE, p)
-    header = None
     for t, payload in parse_packets(area0):
         if t == PKT_HEADER:
-            header = Header.unpack(payload)
-            break
-    if header is None:
-        if last_header is None:
-            return None
-        # header lost: assume the layout did not change (sequence number unknown)
-        header = Header(**{**last_header.__dict__, "sf_seq": (last_header.sf_seq + 1) & 0xFFFF, "flags": last_header.flags & ~FLAG_LAST})
-        hdr_ok = False
-    else:
-        hdr_ok = True
+            h = Header.unpack(payload)
+            if h is not None:
+                return h, True
+    if last_header is None:
+        return None, False
+    # header lost: assume the layout did not change (sequence number guessed)
+    return Header(**{**last_header.__dict__, "sf_seq": (last_header.sf_seq + 1) & 0xFFFF,
+                     "flags": last_header.flags & ~FLAG_LAST}), False
+
+
+def decode_payload(header: Header, blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
+                   hdr_ok: bool = True) -> DecodedSuperframe:
+    """Decode the digital groups and analog blocks of a superframe given (possibly deinterleaved) blocks."""
     pl = plan(header, p)
     area = bytearray()
     n_ok = 1 if hdr_ok else 0
@@ -364,6 +451,17 @@ def decode_superframe(blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
                              np.concatenate(vals) if vals else np.zeros(0),
                              np.concatenate(noise) if noise else np.zeros(0),
                              n_ok, p.blocks_per_sf, snr)
+
+
+def decode_superframe(blocks: List[EqualisedBlock], p: ModemParams = DEFAULT,
+                      last_header: Optional[Header] = None) -> Optional[DecodedSuperframe]:
+    """blocks: the B equalised data blocks of one superframe (block index order), no interleaving."""
+    if len(blocks) != p.blocks_per_sf:
+        return None
+    header, hdr_ok = decode_header(blocks, p, last_header)
+    if header is None:
+        return None
+    return decode_payload(header, blocks, p, hdr_ok)
 
 
 def transmission_symbols(superframes: List[np.ndarray], p: ModemParams = DEFAULT) -> np.ndarray:

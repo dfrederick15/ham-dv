@@ -29,7 +29,8 @@ def add_media_args(ap: argparse.ArgumentParser):
     ap.add_argument("--size", default="96x72", help="video size WxH (multiples of 8), e.g. 64x48, 96x72, 128x96")
     ap.add_argument("--frames-per-sf", type=int, default=3, help="video frames per superframe (3 = ~2 fps)")
     ap.add_argument("--mode", default="16qam-3/4", choices=sorted(MODE_BY_NAME), help="digital block modulation/code rate")
-    ap.add_argument("--audio-rate", type=int, default=1200, choices=[0, 1200, 1600, 2400], help="vocoder bit rate (0 = no audio)")
+    ap.add_argument("--audio-rate", type=int, default=1200, choices=[0, 1200, 1600, 2400, 6000, 8000, 12000, 16000],
+                    help="voice codec: 1200/1600/2400 built-in LPC vocoder; 6000-16000 Opus wideband (DV, needs libopus and a fast profile); 0 = none")
     ap.add_argument("--analog", action="store_true", help="use the analog (SoftCast-style) video transport")
     ap.add_argument("--analog-blocks", type=int, default=3, help="analog data blocks per superframe (analog mode)")
     ap.add_argument("--refresh", type=int, default=12, help="intra refresh period in frames (digital video)")
@@ -40,6 +41,8 @@ def add_media_args(ap: argparse.ArgumentParser):
     ap.add_argument("--baud", type=int, default=1600, choices=[1600, 2000, 4000],
                     help="1600/2000: voice channel (mic/speaker path, repeater); 4000: flat 9600-baud data port (16 kHz audio)")
     ap.add_argument("--long-code", action="store_true", help="one LDPC codeword per superframe (~1 dB gain, all-or-nothing)")
+    ap.add_argument("--interleave", type=int, default=1, choices=[1, 2, 4, 8],
+                    help="interleave codewords across this many superframes (time diversity against fading; adds latency)")
     ap.add_argument("--profile", default=None, choices=sorted(PROFILES),
                     help="waveform profile (overrides --baud): voice, voice2k, flat, ssb (HF single sideband), am (HF AM)")
 
@@ -49,7 +52,7 @@ def make_tx(args) -> Transmitter:
     cfg = TxConfig(callsign=args.callsign, width=w, height=h, frames_per_sf=args.frames_per_sf,
                    audio_mode=args.audio_rate, dig_mode=args.mode, analog=args.analog,
                    analog_blocks=args.analog_blocks, refresh=args.refresh, level=args.level, text=args.text,
-                   baud=args.baud, long_code=args.long_code, profile=args.profile)
+                   baud=args.baud, long_code=args.long_code, profile=args.profile, interleave=args.interleave)
     return Transmitter(cfg)
 
 
@@ -67,8 +70,9 @@ def generate_transmission(tx: Transmitter, video: VideoSource, audio_src: np.nda
             f = video.read(t)
             frames.append(f)
         na = tx.sf_audio_samples
-        a = audio_src[s * na:(s + 1) * na] if tx.aenc is not None else np.zeros(0)
-        if tx.aenc is not None and len(a) < na:
+        has_audio = tx.aenc is not None or tx.opus is not None
+        a = audio_src[s * na:(s + 1) * na] if has_audio else np.zeros(0)
+        if has_audio and len(a) < na:
             a = np.concatenate([a, np.zeros(na - len(a))])
         parts.append(tx.superframe(a, frames, last=(s == n_sf - 1)))
         if sent_frames is not None:
@@ -79,13 +83,14 @@ def generate_transmission(tx: Transmitter, video: VideoSource, audio_src: np.nda
     return np.concatenate(parts)
 
 
-def load_audio_source(spec: str, seconds: float) -> np.ndarray:
+def load_audio_source(spec: str, seconds: float, fs: int = 8000) -> np.ndarray:
     from .audioio import read_wav
     if spec in ("synth", None, ""):
-        return synth_test_speech(seconds + 2)
+        from .dsp import resample_int
+        return resample_int(synth_test_speech(seconds + 2), 8000, fs)
     if spec == "none":
-        return np.zeros(int((seconds + 2) * 8000))
-    return read_wav(spec)
+        return np.zeros(int((seconds + 2) * fs))
+    return read_wav(spec, fs)
 
 
 class FrameSink:
@@ -175,14 +180,15 @@ def cmd_sim(args):
     tx = make_tx(args)
     w, h = _size(args.size)
     video = VideoSource(args.video, w, h)
-    audio_src = load_audio_source(args.audio, args.seconds)
+    audio_src = load_audio_source(args.audio, args.seconds, tx.audio_fs)
     sent = []
     flat = args.flat or args.baud == 4000
     hf = tx.p.name if tx.p.name in ("ssb", "am") else ""
     chan_name = {"ssb": f"HF SSB ({args.hf_condition}, mistuned {args.cfo:+.0f} Hz)",
                  "am": f"HF AM ({args.hf_condition}, {'sync' if args.am_sync else 'envelope'} detector)"}.get(
         hf, 'flat 9600-port' if flat else 'voice repeater')
-    print(f"HamDV simulation: profile {tx.p.name} {tx.p.baud:.0f} Bd{' long code' if args.long_code else ''}, "
+    print(f"HamDV simulation: profile {tx.p.name} {tx.p.baud:.0f} Bd{' long code' if args.long_code else ''}"
+          f"{f' interleave {args.interleave}' if args.interleave > 1 else ''}, "
           f"{args.mode}, {w}x{h}, {'analog' if args.analog else 'digital'} video, audio {args.audio_rate} bps, "
           f"{chan_name} channel, SNR {args.snr} dB, drift {args.sro} ppm")
     t0 = time.time()
@@ -214,7 +220,7 @@ def cmd_sim(args):
     if args.out_dir:
         from .audioio import WavWriter
         if audio_out:
-            ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"))
+            ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"), rx.audio_fs)
             ww.write(np.concatenate(audio_out))
             ww.close()
         ww = WavWriter(os.path.join(args.out_dir, "tx_audio.wav"), tx.p.fs)
@@ -232,7 +238,7 @@ def cmd_encode(args):
     tx = make_tx(args)
     w, h = _size(args.size)
     video = VideoSource(args.video, w, h)
-    audio_src = load_audio_source(args.audio, args.seconds)
+    audio_src = load_audio_source(args.audio, args.seconds, tx.audio_fs)
     tx_audio = generate_transmission(tx, video, audio_src, args.seconds)
     ww = WavWriter(args.out, tx.p.fs)
     ww.write(tx_audio)
@@ -253,7 +259,7 @@ def cmd_decode(args):
     sink.finish(sink.fps)
     report(rx, sink)
     if args.out_dir and audio_out:
-        ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"))
+        ww = WavWriter(os.path.join(args.out_dir, "received_audio.wav"), rx.audio_fs)
         ww.write(np.concatenate(audio_out))
         ww.close()
 
@@ -274,11 +280,11 @@ def cmd_tx(args):
         out = AudioOutput(device=args.out_device, fs_dev=args.device_rate, fs_internal=tx.p.fs)
     mic = None
     file_audio = None
-    if tx.aenc is not None:
+    if tx.aenc is not None or tx.opus is not None:
         if args.audio == "mic":
-            mic = AudioInput(device=args.in_device, fs_dev=args.device_rate, fs_internal=8000)
+            mic = AudioInput(device=args.in_device, fs_dev=args.device_rate, fs_internal=tx.audio_fs)
         else:
-            file_audio = load_audio_source(args.audio, args.seconds or 3600)
+            file_audio = load_audio_source(args.audio, args.seconds or 3600, tx.audio_fs)
     ptt = PTT(args.ptt)
     fps = tx.cfg.frames_per_sf / tx.sf_seconds
     print(f"HamDV TX {tx.cfg.callsign}: {args.baud} Bd {args.mode}{' long code' if args.long_code else ''}, {w}x{h} "
@@ -348,7 +354,7 @@ def cmd_rx(args):
     from .audioio import AudioInput, AudioOutput, read_wav
     from .viewer import Viewer
     viewer = Viewer(args.http, smooth_fps=args.smooth_fps) if args.http else None
-    spk = AudioOutput(device=args.out_device, fs_dev=args.device_rate) if args.out_device is not None or not args.no_speaker else None
+    spk = AudioOutput(device=args.out_device, fs_dev=args.device_rate, fs_internal=16000) if args.out_device is not None or not args.no_speaker else None
     sink = FrameSink(args.save_dir) if args.save_dir else None
 
     def on_frame(rgb, info):
@@ -364,7 +370,8 @@ def cmd_rx(args):
 
     def on_audio(samples):
         if spk is not None:
-            spk.write(samples * args.volume)
+            from .dsp import resample_int
+            spk.write(resample_int(samples, rx.audio_fs, 16000) * args.volume)
 
     rx = Receiver(verbose=args.verbose, on_frame=on_frame, on_audio=on_audio,
                   on_text=lambda c, t: print(f"\n  [{c}] {t}"), fs_in=16000)

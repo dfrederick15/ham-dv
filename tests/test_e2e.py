@@ -10,7 +10,8 @@ from hamdv.videocodec import psnr
 
 def run_link(cfg: TxConfig, n_sf=4, snr_db=25, flat=False, **chan):
     tx = Transmitter(cfg)
-    speech = synth_test_speech(n_sf * tx.sf_seconds + 1)
+    from hamdv.dsp import resample_int
+    speech = resample_int(synth_test_speech(n_sf * tx.sf_seconds + 1), 8000, tx.audio_fs)
     parts = [tx.start_transmission()]
     sent_frames = []
     na = tx.sf_audio_samples
@@ -126,3 +127,23 @@ def test_hf_am_envelope_detector():
     assert rx.status["profile"] == "am", rx.status
     assert rx.status["sf_ok"] == 4, rx.status
     assert len(got) >= 9
+
+
+def test_interleaving_fm_roundtrip():
+    cfg = TxConfig(callsign="K4OZI", text="il test", dig_mode="16qam-3/4", long_code=True, interleave=4)
+    tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=5, snr_db=20)
+    assert rx.status["sf_ok"] >= 5, rx.status          # 5 real + 3 flush superframes
+    assert texts and texts[0] == "il test"
+    assert len(got) >= 12
+
+
+def test_dv_opus_on_flat_profile():
+    from hamdv.opuscodec import available
+    if not available():
+        pytest.skip("libopus not installed")
+    cfg = TxConfig(callsign="K4OZI", baud=4000, dig_mode="64qam-3/4", width=96, height=72, frames_per_sf=4,
+                   audio_mode=12000, long_code=True)
+    tx, rx, sent, got, aud, texts, audio = run_link(cfg, n_sf=4, snr_db=26, flat=True)
+    assert tx.audio_fs == 16000 and rx.audio_fs == 16000
+    assert rx.status["sf_ok"] == 4, rx.status
+    assert sum(len(a) for a in aud) >= 4 * tx.sf_audio_samples - 640

@@ -323,6 +323,23 @@ Peak-to-average ratio of the shaped symbol stream is 7.2 dB versus 4.3 dB
 for uniform 256-QAM, but the *audio* PAPR after pulse shaping is unchanged
 (8.7–8.9 dB) because the RRC filter dominates it.
 
+### 4.5 Interleaving across superframes
+
+With $S_k[j]$ the coded symbols of superframe $k$ (flattened over its
+digital blocks) and depth $D$, the symbols transmitted in superframe $k$ are
+
+$$T_k[j] = S_{k - (j \bmod D)}[j],$$
+
+a diagonal convolutional interleaver: each codeword occupies a $1/D$ share
+of $D$ consecutive superframes and adjacent symbols never share one.  The
+receiver rebuilds codeword $m$ from superframes $m \ldots m+D-1$, carrying
+each symbol's own noise variance into the LLRs (a faded superframe is a
+soft erasure).  Superframes are indexed by the header sequence number when
+it decodes and by demodulator continuity otherwise, so lost headers and
+skipped pilots keep the alignment; the deinterleaver survives a
+re-acquisition.  Pilot and header blocks are not interleaved.  The
+transmitter sends $D-1$ flush superframes after the last one.
+
 ## 5. Link layer
 
 Block 0 of every superframe is always QPSK rate-1/2 and carries the

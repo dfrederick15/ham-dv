@@ -58,7 +58,10 @@ def llrs(sym: np.ndarray, bits_per_symbol: int, noise_var: float, points=None, l
     pts, labels = constellation(bits_per_symbol)
     if points is not None:
         pts = points
-    metric = -np.abs(sym[:, None] - pts[None, :]) ** 2 / max(noise_var, 1e-6)    # (n, M)
+    nv = np.maximum(np.asarray(noise_var, dtype=np.float64), 1e-6)
+    if nv.ndim == 1:
+        nv = nv[:, None]                      # per-symbol noise variance (deinterleaved codewords)
+    metric = -np.abs(sym[:, None] - pts[None, :]) ** 2 / nv    # (n, M)
     if log_prior is not None:
         metric = metric + log_prior[None, :]
     out = np.empty((len(sym), bits_per_symbol))

@@ -144,6 +144,29 @@ a **synchronous detector** (`--am-sync` in the simulator; sync-AM / SDR
 receivers in practice) recovers most of it (10/12).  Use QPSK modes on
 fading AM paths.
 
+### Interleaving across superframes: `--interleave 2|4|8`
+
+Spreads every codeword over 2, 4 or 8 consecutive superframes (symbol-level
+diagonal interleaving), so a fade or an impulse burst erases a fraction of a
+codeword instead of all of it.  Costs depth−1 superframes of latency and a
+few flush superframes at the end of a transmission.  On the SSB profile in
+CCIR *moderate* conditions at 12 dB (QPSK 1/2, long code): 65/80 blocks
+without interleaving, 79/88 at depth 4, 87/88 at depth 8.  It does not
+rescue *poor* conditions, where most blocks are already lost to the
+block-length limit.
+
+### Digital voice with Opus: `--audio-rate 6000|8000|12000|16000`
+
+With libopus installed (the binding loads the system library, no Python
+package needed), these modes carry Opus wideband (16 kHz) voice, which is
+the "in the room" quality a vocoder cannot give.  They need throughput:
+Opus 12 kbit/s fits the flat 9600-port profile with 64-QAM (every frame
+delivered in the model), Opus 6 kbit/s fits 2000 baud with shaped 256-QAM
+(plus 1.5 kbit/s of video), and nothing above the LPC vocoder fits a plain
+1600 baud voice channel.  See [DV_DD_PLAN.md](DV_DD_PLAN.md) for the full
+digital-voice and digital-data mode plan (adaptive rate, VARA-style link
+checks, ARQ).
+
 ### Long codes: `--long-code`
 
 One LDPC codeword spans all seven payload blocks of a superframe instead of
@@ -239,6 +262,7 @@ hamdv/framing.py      superframes, header, packets, CRC, block coding
 hamdv/videocodec.py   digital video codec (integer DCT, motion, RDO, arithmetic coding)
 hamdv/softvideo.py    analog video transport (3-D DCT, power allocation, Hadamard, LLSE)
 hamdv/vocoder.py      LPC/LSP mixed-excitation speech codec
+hamdv/opuscodec.py    ctypes binding of libopus for the Opus DV modes
 hamdv/rangecoder.py   adaptive binary range coder
 hamdv/channel.py      channel simulators: FM repeater, flat 9600-port, HF SSB (Watterson), HF AM
 hamdv/tx.py, rx.py    transmitter / receiver pipelines
